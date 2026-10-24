@@ -94,7 +94,7 @@ t_pfv: t_pfv.m $(MTL_T_DEP)
 # The Vulkan layer (#included) over the whole NVN layer, whose device and present path it uses
 t_vk_desc: t_vk_desc.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_desc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
-run: t_nvn t_dirty_slots t_dirty_race t_builtin t_vin t_tbuf2d t_deswz_gpu t_pace t_fstep t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_zskip t_xv t_ub t_vbuf t_geometry t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pfv t_view_levels t_view_swizzle t_vk_desc
+run: t_nvn t_dirty_slots t_dirty_race t_builtin t_vin t_tbuf2d t_deswz_gpu t_pace t_fstep t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_zskip t_xv t_ub t_vbuf t_geometry t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pfv t_view_levels t_view_swizzle t_vk_desc t_bcastc
 	./t_nvn
 	./t_dirty_slots
 	./t_dirty_race
@@ -129,8 +129,11 @@ run: t_nvn t_dirty_slots t_dirty_race t_builtin t_vin t_tbuf2d t_deswz_gpu t_pac
 	DM_NVN_UNWRITTEN_DC=0 MTL_DEBUG_LAYER=1 ./t_rt_range --sample-attachment --both-flags
 	./t_pso_skey
 	MTL_DEBUG_LAYER=1 ./t_pfv
+	./t_bcastc
 	MTL_DEBUG_LAYER=1 ./t_view_levels
 	MTL_DEBUG_LAYER=1 ./t_view_swizzle
 	MTL_DEBUG_LAYER=1 ./t_vk_desc
 	DM_GAME=$(GAME) python3 test_tbdr_budget.py
 .PHONY: run
+t_bcastc: t_bcastc.m ../tex/nvn_bcastc.c ../tex/nvn_bcastc.h ../tex/nvn_bcastc_msl.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h
+	clang -O1 -g -Wall -fobjc-arc -o $@ t_bcastc.m ../tex/nvn_bcdec.c ../tex/nvn_bcastc.c -framework Metal -framework Foundation

@@ -50,3 +50,6 @@ shader_note	Animal Crossing: New Horizons shaders
 # The game wraps its clears in render conditions that skip a target nothing drew into since its last clear: without the key, four clear-only passes wiped the composite before
 # the window copy at frame 900, and every frame came out black (the island probe and the loading icon were drawn into render targets)
 render_cond	on
+# The game asks for present interval 2 (30 fps); with a 60 fps exefs patch its logic steps per frame, so following that interval played at half speed on the iPad.
+# One frame per display tick, as the Mac runs it with DM_PRESENT_INTERVAL=display
+present_interval	display

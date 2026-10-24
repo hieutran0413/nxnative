@@ -99,6 +99,15 @@ cd "<NSP folder>/<id>_build/run" && DM_ROOT="<NSP folder>/<id>_build" DM_ROMFS="
 
 The save is in `<id>_build/run/save` and stays there from run to run. `DM_AOC_DIR` is added when the folder has DLC. `DM_NVN_SHMAP` is added for an NVN game; it names the profile's shader map, or the derived or provisional profile's. A Vulkan or GL game's `DM_MSL_DIR` is `<id>_build/shader`. The switches of `--env-file` are added to the command.
 
+### Save data organization and iCloud cross-device sync
+
+For setups synchronizing progress across Mac and iOS devices:
+1. **Centralize on iCloud Drive:** Gather all game saves under `~/Library/Mobile Documents/com~apple~CloudDocs/Game Saves/<Game Name>/` (e.g. `Game Saves/Animal Crossing`, `Game Saves/Tears of the Kingdom`). Do not create scattered, standalone game folders in the iCloud Drive root. Short aliases (symlinks) such as `ACNH -> Animal Crossing` can be kept inside `Game Saves/`.
+2. **Mac host symlink:** Point `<id>_build/run/save` as a symlink to `~/Library/Mobile Documents/com~apple~CloudDocs/Game Saves/<Game Name>`. The Mac host automatically saves directly to iCloud.
+3. **iOS (iPhone/iPad) sync:** The iOS app sets `UIFileSharingEnabled: true` (`dm/ios/project.yml`), which exposes its Documents directory in Apple's Files app:
+   `Files -> On My iPhone (or iPad) -> <Game Name> -> save/`.
+   Progress can be synced across devices by copying files between `iCloud Drive/Game Saves/<Game Name>/` and `save/`.
+
 Reuse works as for the IPA. Each shader output has its own key, named after the one chain version: `shader/ios/b-<chain>.key` for the iOS libraries and `shader/mac-b-<chain>.key` for the Mac's (`shader/ios/vk.key` and `shader/vk.key` for a Vulkan game, the same with `gl` for a GL game). An iOS build writes both keys, since it builds the Mac's libraries too, so a Mac-only build of a folder already packed as an IPA reuses its shaders. Either key is taken only while the Mac libraries carry a full build's stamp; `c1_full.tsv` or `cb_extent.tsv` that does not name it is made again from them, as for the IPA. An iOS build after a Mac-only build still has the iPhone's libraries to make. It translates the shaders again, because `dmsh_build.py`'s per-shader cache keys include the iOS compile convention. It then takes the Mac libraries from the Metal compile cache (`shader/cache/cas/metallib`) and compiles only the iPhone's.
 
 ## Build and run on a device with Xcode

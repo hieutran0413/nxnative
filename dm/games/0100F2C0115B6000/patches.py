@@ -140,3 +140,17 @@ def frame_step(ctx):
     fs_put(0xd5d80, [B(0xd5d80, start)], 'dynamic resolution only at render scale 1.0')
 
 FRAME_STEP = {'277178b7dba1b6d4949a84778d4abc58': frame_step}
+
+CUTS = {
+    # The Legend of Zelda: Tears of the Kingdom 1.2.0 (v327680): 60 FPS static timing + 1024x1024 shadows
+    '6f32c68dd3bc7d77aa714b80e92a096a': [
+        (0x00ea28dc, '011d0012', '21008052', '60fps present interval 1'),
+        (0x008a9460, 'f5030a2a', '35008052', '60fps speed field 0x14 = 1'),
+        (0x008a94d0, '48050051', '28008052', '60fps speed field 0x18 = 1'),
+        (0x008a9468, 'acc1881a', '2c008052', '60fps speed field 0x18 = 1'),
+        (0x019a2374, '30000094', '1f2003d5', '60fps nop reset call 1'),
+        (0x019adbe8, '13d2ff97', '1f2003d5', '60fps nop reset call 2'),
+        (0x00ccd368, '0b02381e', '0b808052', 'shadow res 1024x1024 mov'),
+        (0x00ccd36c, 'ec023836', '17000014', 'shadow res 1024x1024 branch'),
+    ]
+}

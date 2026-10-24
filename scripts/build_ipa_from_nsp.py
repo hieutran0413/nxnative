@@ -765,6 +765,31 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
     return dst
 
 
+def apply_mods(mods_path, romfs_dest):
+    if not mods_path.exists(): return
+    src_romfs = None
+    if (mods_path / 'romfs').is_dir():
+        src_romfs = mods_path / 'romfs'
+    else:
+        for p in mods_path.rglob('romfs'):
+            if p.is_dir():
+                src_romfs = p
+                break
+    if not src_romfs:
+        src_romfs = mods_path
+    count = 0
+    for root, _, files in os.walk(src_romfs):
+        for f in files:
+            if f.startswith('.'): continue
+            src_f = Path(root) / f
+            rel = src_f.relative_to(src_romfs)
+            dest_f = romfs_dest / rel
+            dest_f.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src_f, dest_f)
+            count += 1
+    say(f'applied mod ({count} files from {src_romfs}) → {romfs_dest}')
+
+
 def build_mismatch(d, name, g):   # the modules of an extraction whose build ID is not the one the profile's build row of that version registers ([] = the registered build)
     want = g.builds().get(name)
     if want is None: return [f'{name} has no build row']
@@ -1448,6 +1473,7 @@ def parse_args(argv):
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
+    ap.add_argument('--mods', help='path to folder with mod/translation files (e.g. romfs/ or Atmosphere folder) to apply to RomFS')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check): write them as read and go on instead of stopping')
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
@@ -1593,6 +1619,9 @@ def main(args=None):
         say(f'derived game profile for {pkg_ver} ({disp}): {g.dir}')
     sv = versions if derived else need   # the versions whose files the shaders come from
     game = dirs[pkg_ver]
+    mods_arg = getattr(args, 'mods', None) or (nsp_dir / 'mods' if (nsp_dir / 'mods').is_dir() else None)
+    if mods_arg:
+        apply_mods(Path(mods_arg), game / 'RomFS')
     # how the shaders are got follows from the packed version's files (profile_guess.py shader_sources): the graphics API, and the shaders made only at run time
     src = pg.build_sources(game / 'ExeFS', game / 'RomFS', g.words('modules'))
     gfx = src['graphics'][0]   # nvn, vulkan (Hades: the host's Vulkan layer, SPIR-V shaders) or gl (Digimon Story Cyber Sleuth: the host's GL layer, GLSL sources)

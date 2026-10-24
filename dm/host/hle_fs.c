@@ -89,6 +89,8 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         strlcpy(g_mnt[g_nmnt].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[0].overlay);
     // The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only -- saves still read, every write fails, commits are no-ops, the committed version is untouched, and the front end is told
     // (each of these three failures used to call die: with the phone's storage full the game exited as soon as it mounted its saves)
+    char real_dir[1024];
+    if (realpath(dir, real_dir)) dir = real_dir;
     int txn_err = 0, k = 0;
     while (txn && k < g_nmnt && strcmp(g_mnt[k].commit, dir)) k++;
     if (txn && k < g_nmnt) {   // a second name for a save already mounted (account and device save data are one host save): it shares that transaction, whose pending writes a new clone would drop

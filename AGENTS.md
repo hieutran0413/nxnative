@@ -15,4 +15,19 @@
 
   The translator is `dm/gfx/tools/dmsh_xlate_bin`, which matches `dmsh_chain.lock`; a fresh `dotnet publish` does not.
 - iOS builds are unsigned IPAs that the user sideloads and tests; diagnostics come back as the app's `Documents/log.txt`. Do not sign or install builds on the user's devices.
+- Save data management and iCloud cross-device sync:
+  - Centralize all game saves under `~/Library/Mobile Documents/com~apple~CloudDocs/Game Saves/<Game Name>/` (e.g. `Game Saves/Animal Crossing`, `Game Saves/Tears of the Kingdom`). Do NOT pollute the iCloud Drive root with loose game-specific folders like `ACNH_Save` or `TOTK_Save`. Maintain short alias symlinks inside `Game Saves/` (e.g. `ACNH -> Animal Crossing`, `TOTK -> Tears of the Kingdom`).
+  - On macOS:
+    - Link the build run's save directory `<id>_build/run/save` directly to the centralized iCloud Drive path:
+      `ln -sfn "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Game Saves/<Game Name>" "<id>_build/run/save"`. The Mac host reads and writes progress straight to iCloud Drive in real time without manual syncing.
+  - On iOS / iPadOS (iPhone 14 Pro Max, iPad mini 7):
+    - The app enables `UIFileSharingEnabled: true` and `LSSupportsOpeningDocumentsInPlace: true` (`dm/ios/project.yml`), exposing saves inside the Files app:
+      `Files -> On My iPhone (or iPad) -> <Game Name> -> save/`.
+    - Standard 1-Tap iOS Shortcut recipe for cross-device sync (`Đồng bộ <Game Name>`):
+      1. Action "Choose from Menu":
+         - Option 1: `📥 iCloud ➔ iPhone/iPad` (pull latest progress after playing on Mac):
+           `Get Contents of Folder` (`iCloud Drive/Game Saves/<Game Name>`) ➔ `Save File` to destination (`On My iPhone or iPad/<Game Name>/save/`), with `Overwrite If File Exists: ON` and `Ask Where to Save: OFF` ➔ `Show Notification`.
+         - Option 2: `📤 iPhone/iPad ➔ iCloud` (push latest progress back to cloud for Mac):
+           `Get Contents of Folder` (`On My iPhone or iPad/<Game Name>/save/`) ➔ `Save File` to destination (`iCloud Drive/Game Saves/<Game Name>/`), with `Overwrite If File Exists: ON` and `Ask Where to Save: OFF` ➔ `Show Notification`.
+      2. Add Shortcut to Home Screen for fast 1-tap operation.
 - Commit only when asked, with `git -c user.name=seedds -c user.email=seedds@gmail.com commit`.

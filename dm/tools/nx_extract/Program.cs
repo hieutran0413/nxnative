@@ -30,6 +30,22 @@ static class P {
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
+        if (a[1] == "--get") {
+            var bPkg = OpenNsp(ks, a[2]); var uPkg = a[3] == "-" ? null : OpenNsp(ks, a[3]);
+            Nca bProg = Pick(bPkg, NcaContentType.Program) ?? throw new Exception("no base");
+            Nca uProg = uPkg == null ? null : Pick(uPkg, NcaContentType.Program, bProg.Header.TitleId);
+            IStorage r = uProg != null ? bProg.OpenStorageWithPatch(uProg, NcaSectionType.Data, IntegrityCheckLevel.None) : bProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.None);
+            var fs = new RomFsFileSystem(r);
+            using var f = new UniqueRef<IFile>();
+            string target = a[4].StartsWith("/") ? a[4] : "/" + a[4];
+            fs.OpenFile(ref f.Ref, target.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+            f.Get.GetSize(out long size).ThrowIfFailure();
+            byte[] buf = new byte[size];
+            f.Get.Read(out long read, 0, buf).ThrowIfFailure();
+            File.WriteAllBytes(a[5], buf);
+            Console.WriteLine($"Extracted {target} ({size} bytes) -> {a[5]}");
+            return 0;
+        }
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");

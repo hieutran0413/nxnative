@@ -76,6 +76,34 @@ for off, ob, nb, why in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
     assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'cut original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
     IMG[off:off + len(nb)] = nb
+
+# Atmosphere IPS patches support
+ips_dir = os.environ.get('DM_IPS_DIR', '/Volumes/My Data/Development/Games/AnimalCrossing/mods/extracted_60fps/atmosphere/exefs_patches/ACNH_60FPS_SpeedFix')
+if os.path.isdir(ips_dir):
+    for ips_path in glob.glob(os.path.join(ips_dir, '*.ips')):
+        ips_name = os.path.basename(ips_path).upper()
+        if ips_name.startswith(BUILD_ID.upper()):
+            ips_data = open(ips_path, 'rb').read()
+            if ips_data.startswith(b'IPS32'):
+                idx = 5; records_applied = 0
+                while idx < len(ips_data):
+                    if ips_data[idx:idx+4] == b'EEOF': break
+                    off = int.from_bytes(ips_data[idx:idx+4], 'big')
+                    sz = int.from_bytes(ips_data[idx+4:idx+6], 'big')
+                    idx += 6
+                    # Atmosphere IPS32 patches for NSO modules use file offsets (including 0x100 NSO header).
+                    # Since IMG represents loaded memory starting at 0, subtract 0x100.
+                    mem_off = off - 0x100 if off >= 0x100 else off
+                    if sz == 0:
+                        rle_sz = int.from_bytes(ips_data[idx:idx+2], 'big')
+                        val = ips_data[idx+2:idx+3]
+                        idx += 3
+                        IMG[mem_off:mem_off + rle_sz] = val * rle_sz
+                    else:
+                        IMG[mem_off:mem_off + sz] = ips_data[idx:idx+sz]
+                        idx += sz
+                    records_applied += 1
+                print(f'Applied {records_applied} IPS32 patch records from {ips_name}')
 # Key page indices are fixed; the key page content is written by the loader as "actual key number × 8".
 KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511}
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}

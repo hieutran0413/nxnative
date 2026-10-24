@@ -136,6 +136,56 @@ Each prepared game is a scheme in the shared workspace (by default `NxNative.xcw
 
 The unsigned IPA build still uses the repository's `dm/ios/DmIOS.xcodeproj`, skips the resource phase (`DM_COPY_GAME_RESOURCES=NO`) and packs the resources straight from the drive as before.
 
+## Fast device deployment with Apple CoreDevice (`devicectl`)
+
+Large Switch games (such as *Animal Crossing: New Horizons* at 11 GB with 128,000+ files, or *Tears of the Kingdom* at 16 GB) suffer from severe latency bottlenecks when sideloaded using traditional tools (AltStore, Sideloadly, iloader) over AFC (Apple File Conduit):
+- AFC transfers files individually via USB multiplexing (`usbmuxd`). With over 128,000 round-trip latency overheads, installation typically takes **1.5 to 2 hours**.
+- Apple's CoreDevice stack on iOS 17 and later streams application bundles directly via a dedicated high-speed tunnel.
+
+### Direct streaming install (~5–6 minutes)
+
+1. **Extract and sign the app bundle:**
+   An unsigned IPA can be unpacked, provisioned with your developer identity, and signed with macOS `codesign`:
+   ```bash
+   # Extract
+   unzip -q Game.ipa -d /tmp/Extracted
+
+   # Embed your mobileprovision
+   cp embedded.mobileprovision /tmp/Extracted/Payload/DmIOS.app/embedded.mobileprovision
+
+   # Match CFBundleIdentifier with your provisioning profile's App ID
+   plutil -replace CFBundleIdentifier -string "org.nxnative.<title_id>.<team_id>" /tmp/Extracted/Payload/DmIOS.app/Info.plist
+
+   # Codesign the entire bundle with your developer certificate
+   codesign --force --sign "<identity_or_hash>" \
+       --entitlements /path/to/entitlements.plist \
+       --timestamp=none \
+       /tmp/Extracted/Payload/DmIOS.app
+   ```
+
+2. **Stream install using `xcrun devicectl`:**
+   ```bash
+   xcrun devicectl device install app --device <UDID> /tmp/Extracted/Payload/DmIOS.app
+   ```
+   CoreDevice packages the application bundle into an optimized transfer stream directly over the wired CoreDevice tunnel (`remoted`), installing an 11 GB game in approximately 5 to 6 minutes.
+
+3. **Launch and retrieve diagnostic logs:**
+   ```bash
+   # Launch
+   xcrun devicectl device process launch --device <UDID> <bundle_id>
+
+   # Fetch app log directly from app container
+   xcrun devicectl device copy from --device <UDID> \
+       --domain-type appDataContainer <bundle_id> \
+       tmp/app_log.txt /tmp/app_log.txt
+   ```
+
+### Over-the-air installation via LiveContainer (HTTP Range)
+
+For devices running LiveContainer, large IPAs can be served directly over the local network using an HTTP server that supports HTTP Range requests (partial content, enabling multi-threaded and resumable downloads):
+- Serve the directory containing the `.ipa` using a Range-supporting Python server (`Accept-Ranges: bytes`, `HTTP 206 Partial Content`).
+- In LiveContainer on iOS, input `http://<Mac_Local_IP>:<Port>/<Game>.ipa` to download and install natively over local Wi-Fi.
+
 ## Port another game
 
 Each game has a profile in `dm/games/<id>/`:

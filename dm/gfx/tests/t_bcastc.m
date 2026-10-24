@@ -33,11 +33,13 @@ int main(void) { @autoreleasepool {
         // The kernel: BC1 blocks at offset 0, ASTC blocks after them
         size_t off2 = (pitch * nby + 255) & ~(size_t)255; id<MTLBuffer> buf = [dev newBufferWithLength:off2 + apitch * nby options:MTLResourceStorageModeShared]; memcpy(buf.contents, bc, pitch * nby); memset((uint8_t *)buf.contents + off2, 0xCD, apitch * nby);
         uint32_t pr[7] = {0, (uint32_t)pitch, w, h, 1, (uint32_t)off2, (uint32_t)apitch}; id<MTLBuffer> par = [dev newBufferWithBytes:pr length:sizeof pr options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cnt = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; memset(cnt.contents, 0, 16);
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:w height:h mipmapped:NO]; td.storageMode = MTLStorageModeShared;
         id<MTLTexture> tex = [dev newTextureWithDescriptor:td]; id<MTLBuffer> out = [dev newBufferWithLength:(size_t)w * h * 4 options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        [ce setComputePipelineState:p1]; [ce setBuffer:buf offset:0 atIndex:0]; [ce setBuffer:par offset:0 atIndex:1]; [ce dispatchThreadgroups:MTLSizeMake((nbx + 7) / 8, (nby + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [ce endEncoding];
+        [ce setComputePipelineState:p1]; [ce setBuffer:buf offset:0 atIndex:0]; [ce setBuffer:par offset:0 atIndex:1]; [ce setBuffer:cnt offset:0 atIndex:2]; [ce dispatchThreadgroups:MTLSizeMake((nbx + 7) / 8, (nby + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [ce endEncoding];
         [cb commit]; [cb waitUntilCompleted];
+        if (*(uint32_t *)cnt.contents != lost) { printf("  ✗ mode %d: the kernel counted %u lost transparent indices, the C function %zu\n", mode, *(uint32_t *)cnt.contents, lost); fails++; }
         int kdiff = memcmp((uint8_t *)buf.contents + off2, astc, apitch * nby) != 0; if (kdiff) { printf("  ✗ mode %d: the kernel's blocks differ from the C function's\n", mode); fails++; }
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:astc bytesPerRow:apitch];
         cb = [q commandBuffer]; ce = [cb computeCommandEncoder]; [ce setComputePipelineState:p2]; [ce setTexture:tex atIndex:0]; [ce setBuffer:out offset:0 atIndex:0];
@@ -54,6 +56,17 @@ int main(void) { @autoreleasepool {
         printf("mode %d %ux%u: %zu blocks with a lost transparent index; 4-colour pixels %zu max error %d (error 0/1/2/>=3: %zu/%zu/%zu/%zu); 3-colour pixels %zu max error %d; transparent pixels %zu\n", mode, w, h, lost, n4, max4, hist[0], hist[1], hist[2], hist[3], n3, max3, ntr);
         if (big) { printf("  ✗ mode %d: %zu 4-colour pixels are off by more than 2\n", mode, big); fails++; }
         free(bc); free(astc); free(ref);
+    }
+    {   // What an unwritten ASTC block reads as: zeros are invalid (Metal's error colour), the void-extent block that nvn_mtl.m's new-texture fill uses is transparent black
+        uint8_t blk[2][16] = {{0}, {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+        for (int k = 0; k < 2; k++) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:4 height:4 mipmapped:NO]; td.storageMode = MTLStorageModeShared;
+            id<MTLTexture> tex = [dev newTextureWithDescriptor:td]; [tex replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:blk[k] bytesPerRow:16];
+            id<MTLBuffer> out = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:p2]; [ce setTexture:tex atIndex:0]; [ce setBuffer:out offset:0 atIndex:0]; [ce dispatchThreads:MTLSizeMake(4, 4, 1) threadsPerThreadgroup:MTLSizeMake(4, 4, 1)]; [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            const uint8_t *o = out.contents; printf("%s block reads as %d,%d,%d,%d\n", k ? "void-extent" : "all-zero", o[0], o[1], o[2], o[3]);
+            if (k && (o[0] || o[1] || o[2] || o[3])) { printf("  ✗ the void-extent block is not transparent black\n"); fails++; }
+        }
     }
     printf(fails ? "FAIL (%d)\n" : "OK\n", fails); return fails ? 1 : 0;
 } }

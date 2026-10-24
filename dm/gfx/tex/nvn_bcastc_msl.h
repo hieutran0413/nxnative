@@ -1,10 +1,10 @@
-// The Metal kernel of nvn_bcastc.c: one thread per BC1 block of a buffer, writing the ASTC block into the same buffer (offsets in bytes: off / pitch for the BC1 blocks, ooff / opitch for the ASTC blocks)
+// The Metal kernel of nvn_bcastc.c: one thread per BC1 block of a buffer, writing the ASTC block into the same buffer (a third buffer counts the blocks that lose a transparent index; offsets in bytes: off / pitch for the BC1 blocks, ooff / opitch for the ASTC blocks)
 #pragma once
 static const char k_bcastc_msl[] =
 "#include <metal_stdlib>\nusing namespace metal;\n"
 "struct T { uint off, pitch, w, h, fmt, ooff, opitch; };\n"
 "static void put(thread uint *o, uint pos, uint n, uint v) { for (uint i = 0; i < n; i++) o[(pos + i) >> 5] |= ((v >> i) & 1u) << ((pos + i) & 31); }\n"
-"kernel void bc1a(device uchar *buf [[buffer(0)]], device const T &p [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
+"kernel void bc1a(device uchar *buf [[buffer(0)]], device const T &p [[buffer(1)]], device atomic_uint *lost [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {\n"
 "  uint nbx = (p.w + 3) / 4, nby = (p.h + 3) / 4; if (g.x >= nbx || g.y >= nby) return;\n"
 "  device const uchar *b = buf + p.off + g.y * p.pitch + g.x * 8;\n"
 "  uint c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8), ix = b[4] | (b[5] << 8) | (b[6] << 16) | (uint(b[7]) << 24);\n"
@@ -14,8 +14,10 @@ static const char k_bcastc_msl[] =
 "  uint m4[4] = {0, 3, 1, 2}, m3[4] = {0, 3, 1, 0}; uint o[4] = {0, 0, 0, 0};\n"
 "  put(o, 0, 11, 0x042); put(o, 13, 4, 8);\n"
 "  put(o, 17, 8, uint(lo.x)); put(o, 25, 8, uint(hi.x)); put(o, 33, 8, uint(lo.y)); put(o, 41, 8, uint(hi.y)); put(o, 49, 8, uint(lo.z)); put(o, 57, 8, uint(hi.z));\n"
+"  bool hit = false;\n"
 "  for (int i = 0; i < 16; i++) { uint idx = (ix >> (2 * i)) & 3, code;\n"
-"    if (!four && idx == 3) code = 0; else { code = four ? m4[idx] : m3[idx]; if (sw) code = 3 - code; }\n"
+"    if (!four && idx == 3) { code = 0; hit = true; } else { code = four ? m4[idx] : m3[idx]; if (sw) code = 3 - code; }\n"
 "    put(o, 127 - 2 * i, 1, code & 1); put(o, 126 - 2 * i, 1, code >> 1); }\n"
+"  if (hit) atomic_fetch_add_explicit(lost, 1u, memory_order_relaxed);\n"
 "  device uchar *d = buf + p.ooff + g.y * p.opitch + g.x * 16;\n"
 "  for (int i = 0; i < 16; i++) d[i] = uchar(o[i >> 2] >> (8 * (i & 3))); }\n";

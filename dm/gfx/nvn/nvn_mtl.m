@@ -389,8 +389,22 @@ static _Atomic uint64_t g_reg_gen = 1;   // Change generation of memory pool / t
 // (they measured on a 17 Pro Max a 512 MB render-target pool addressed 0 times in a run, with about 530 MB more device wired memory; a 4 GB A14 was ended by the system within seconds of launch because of it).
 // So a pool is not put into the residency set when created; it is put in, and the residency set committed on the spot, the first time the GPU gets its address through mtl_addr / mtl_gpu_addr -- these are the only two ways the GPU gets pool addresses,
 // and committing on the spot is earlier than any command buffer commit that uses it. CPU-side reads of pool contents through mtl_addr trigger it too (conservative, never misses). Caller holds g_mu
+static uint64_t g_pool_res_bytes, g_pool_res_touched, g_pool_res_big;   // bytes of the pools put in the residency set, how many of those pages the process already had in memory (mincore) when that happened, and pools of 8 MB or more (for the memory readout; under g_mu)
+static uint64_t pool_touched(uintptr_t a, size_t n) {   // bytes of [a, a + n) whose pages are in memory now: wiring a pool makes the system fault in every page, so the rest of the pool is new memory
+    unsigned char vec[4096]; uint64_t t = 0; size_t pg = (size_t)getpagesize();
+    for (size_t o = 0; o < n; o += sizeof vec * pg) {
+        size_t c = n - o < sizeof vec * pg ? n - o : sizeof vec * pg; size_t np = (c + pg - 1) / pg;
+        if (mincore((void *)(a + o), c, (char *)vec) != 0) return t;
+        for (size_t k = 0; k < np; k++) if (vec[k] & 1) t += pg;
+    }
+    return t;
+}
 static void pool_res(int i) {
     if (g_pools[i].res) return;
+    size_t n = (size_t)g_pools[i].buf.length; uint64_t touched = pool_touched(g_pools[i].base, n);
+    g_pool_res_bytes += n; g_pool_res_touched += touched;
+    if (n >= (8u << 20)) { static int lines; g_pool_res_big++; if (lines++ < 300) MLOG("pool made resident: %p size %llu MB, %llu MB of it already in memory (pools resident now %d, %llu MB wired in all, %llu MB of that already in memory)",
+        g_pools[i].key, (unsigned long long)(n >> 20), (unsigned long long)(touched >> 20), g_pool_res_n + 1, (unsigned long long)(g_pool_res_bytes >> 20), (unsigned long long)(g_pool_res_touched >> 20)); }
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
 }
 void mtl_pool_add(const void *mem, uint64_t size) {
@@ -1431,10 +1445,16 @@ static int no_bc(void) {
     return v;
 }
 static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp) { return no_bc() && nvn_bc_unpacked(nvn_fmt, pf, bpp); }
+static uint64_t g_unp_n[4][5], g_unp_b[4][5];   // decompressed-BC textures made, by format class (BC1, BC2/3/7, BC4/5, BC6H) and largest side (≤256, ≤512, ≤1024, ≤2048, more), and their bytes (for the memory readout)
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
-    int unp = 0; { uint32_t upf; int ubpp; if (bc_unpack(t->d.format, &upf, &ubpp)) { pf = upf; unp = 1; } }
+    int unp = 0; { uint32_t upf; int ubpp; if (bc_unpack(t->d.format, &upf, &ubpp)) { pf = upf; unp = 1;
+        // memory readout: what the decompressed storage costs by format and by size (with a full mip chain's 4/3 and the layers / depth), against the BC bytes it replaces
+        uint64_t w = t->d.width ? t->d.width : 1, h = t->d.height ? t->d.height : 1, z = (t->d.target == 3 ? t->d.height : t->d.target == 4 || t->d.target == 9 ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 2 ? t->d.depth : 1); if (!z) z = 1;
+        uint64_t dec = w * h * z * (uint64_t)ubpp * (t->d.levels > 1 ? 4 : 3) / (t->d.levels > 1 ? 3 : 3), mx = w > h ? w : h; int bk = mx <= 256 ? 0 : mx <= 512 ? 1 : mx <= 1024 ? 2 : mx <= 2048 ? 3 : 4, fk = ubpp == 8 ? 3 : ubpp == 4 ? (t->d.format == 0x41 || t->d.format == 0x42 || t->d.format == 0x45 || t->d.format == 0x46 ? 0 : 1) : 2;
+        if (dec >= (24u << 20)) { static int big; if (big++ < 60) MLOG("big decompressed BC texture ser=%llu: %llux%llu x%llu layers, target %d, levels %u, NVN format %#x → %llu MB (BC: %llu MB)", (unsigned long long)t->serial, (unsigned long long)w, (unsigned long long)h, (unsigned long long)z, t->d.target, t->d.levels, t->d.format, (unsigned long long)(dec >> 20), (unsigned long long)(dec / ((uint64_t)ubpp * (t->d.format == 0x41 || t->d.format == 0x42 || t->d.format == 0x45 || t->d.format == 0x46 || t->d.format == 0x49 || t->d.format == 0x4a ? 8 : 4)) >> 20)); }
+        __atomic_fetch_add(&g_unp_n[fk][bk], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_unp_b[fk][bk], dec, __ATOMIC_RELAXED); } }
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
     if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048 || t->d.levels > 15) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -2131,6 +2151,12 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     // Objects read from a weak table come back retained + autoreleased: the frame hook runs on a guest thread with no autorelease pool that drains, so without this wrapper every buffer counted would be pinned for good (the readout creating the leak itself)
     int pres = 0; @autoreleasepool { pthread_mutex_lock(&g_mu); pres = g_pool_res_n; for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_mb += b.length; } pthread_mutex_unlock(&g_mu); } dead_mb >>= 20;   // host objects held by serial (textures / packaged textures / programs): if it climbs along with GPU allocated, textures are not being released
     // os_proc_available_memory: how far this process is from being terminated by the system for memory, iOS only; the Mac writes "none". On a phone, a crash with no log is most likely this number reaching 0
+    { static const char *fn[4] = {"BC1", "BC2/3/7", "BC4/5", "BC6H"}; char ub[400]; int o = 0; uint64_t tot = 0;
+      for (int f = 0; f < 4; f++) { uint64_t fb = 0, fnn = 0; for (int b = 0; b < 5; b++) { fb += g_unp_b[f][b]; fnn += g_unp_n[f][b]; } tot += fb;
+        if (fnn) o += snprintf(ub + o, sizeof ub - o, " %s %llu MB in %llu (", fn[f], (unsigned long long)(fb >> 20), (unsigned long long)fnn);
+        for (int b = 0; fnn && b < 5; b++) o += snprintf(ub + o, sizeof ub - o, "%s%llu", b ? "/" : "", (unsigned long long)(g_unp_b[f][b] >> 20));
+        if (fnn) o += snprintf(ub + o, sizeof ub - o, ")"); }
+      if (tot) MLOG("decompressed BC textures made so far: %llu MB;%s (MB by largest side ≤256/≤512/≤1024/≤2048/more)", (unsigned long long)(tot >> 20), ub); }
     char avail[32] = "none";
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));

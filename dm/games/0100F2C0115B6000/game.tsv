@@ -35,6 +35,7 @@ mem_reserve	0x140000000
 mem_alias	0x98000000
 mem_stack	0x10000000
 app_pool	0xCD500000
+mem_map_limit	on
 
 # ---- Graphics ----
 # Streamed textures are written by the CPU straight into pool memory (already in GPU layout) and published with nvnMemoryPoolFlushMappedRange (hle_nvn.c ft_add)

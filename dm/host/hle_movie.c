@@ -6,6 +6,9 @@
 #include <mach/mach.h>
 #include <pthread.h>
 #include <unistd.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
@@ -487,7 +490,15 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     // offered (16 of 16 video, 59 of 64 audio), so how far its extractor gets ahead of the picture on screen is the video slots plus the 4 queued packets. With 8 that was 0.4 s, and the
     // audio behind the next video packet, whose clock the player follows, ran dry: 86 pictures in 25 s, a black screen with a loading icon. With 16 (or 32) all 1,960 play at 30 fps.
     // A video slot is allocated when first used, so the 8 more cost a greedy player 24 MB of NV12 at 1080p (64 MB as RGBA)
-    d->nout = audio ? MD_NOUT : MD_NOUT_VIDEO;
+int dm_no_increased_memory(void);
+    int vslots = MD_NOUT_VIDEO;
+    const char *ev_vslots = getenv("DM_MOVIE_VIDEO_SLOTS");
+    if (ev_vslots && atoi(ev_vslots) > 0) vslots = atoi(ev_vslots);
+    else if (dm_no_increased_memory()) vslots = 4;
+#if TARGET_OS_IPHONE
+    else if (os_proc_available_memory() < (500ull << 20)) vslots = 4;
+#endif
+    d->nout = audio ? MD_NOUT : vslots;
     for (int i = 0; i < MD_NIN; i++) { d->in[i] = malloc(MD_INCAP); d->infree[i] = i; }
     d->ninfree = MD_NIN;
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20);
@@ -571,7 +582,17 @@ static void md_reset(mdec_t *d, int close) {
     for (int i = 0; i < MD_NIN; i++) { d->infree[i] = i; d->instale[i] = d->inown[i] ? now : 0; d->inown[i] = 0; }
     d->ninfree = MD_NIN; d->noutq = 0; d->npend = 0; d->avc_drain = 0; d->in_eos = 0;
     // a flush keeps each slot's last picture: the same game reads an output it acquired before the flush right after it (a black frame in the loop otherwise)
-    for (int i = 0; i < MD_NOUT; i++) { d->out[i].used = 0; if (close) d->out[i].pic = 0; }
+    for (int i = 0; i < MD_NOUT; i++) {
+        d->out[i].used = 0;
+        if (close) {
+            d->out[i].pic = 0;
+            if (d->out[i].frm) {
+                free(d->out[i].frm);
+                d->out[i].frm = NULL;
+                d->out[i].cap = 0;
+            }
+        }
+    }
     pthread_mutex_unlock(&d->mu);
     pthread_mutex_unlock(&d->dmu);
 }

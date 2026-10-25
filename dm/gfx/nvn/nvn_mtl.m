@@ -1428,7 +1428,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
 // alternates between two textures instead of allocating one per frame: Link's Awakening's title movie made and freed an 8 MB texture a frame)
-@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen; const void *span; int sparse, vbase; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
+@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, use_fence, serial; const void *span; int sparse, vbase; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 @implementation NvPkg
 - (void)dealloc { res_remove(tex); if (spare) res_remove(spare); }
@@ -1454,15 +1454,16 @@ static uint32_t bc_astc_fam(uint32_t nvn_fmt) {   // the ASTC format of a BC1-fa
     if (!on || !no_bc()) return 0;
     switch (nvn_fmt) { case 0x41: case 0x42: return MTLPixelFormatASTC_4x4_LDR; case 0x45: case 0x46: return MTLPixelFormatASTC_4x4_sRGB; default: return 0; }
 }
-// The BC1 RGBA formats (0x42 / 0x46): formerly restricted to >= 2048.
-// On A16 devices with tight 3 GB memory limit, DM_NO_BC_ASTC_MIN (default 0) allows transcoding all BC1 textures to ASTC 4x4.
+// The BC1 RGBA formats (0x42 / 0x46) keep their punch-through alpha, which ASTC RGB blocks lose,
+// so only their big textures (largest side >= 2048) are stored as ASTC; smaller textures stay RGBA8 to avoid magenta error blocks.
+// DM_NO_BC_ASTC_MIN overrides the threshold if needed.
 static uint32_t bc_astc_pf(uint32_t nvn_fmt, int target, uint32_t w, uint32_t h) {
     uint32_t pf = bc_astc_fam(nvn_fmt);
     if (!pf || target == 2) return 0;
     static int min_dim = -1;
     if (min_dim < 0) {
         const char *e = getenv("DM_NO_BC_ASTC_MIN");
-        min_dim = e ? atoi(e) : 0; // 0 = all BC1 converted to ASTC
+        min_dim = e ? atoi(e) : 2048;
     }
     if ((nvn_fmt == 0x42 || nvn_fmt == 0x46) && (int)MAX(w, h) < min_dim) return 0;
     return pf;
@@ -2142,6 +2143,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     if (packaged) {
         NvPkg *pk = [have isKindOfClass:[NvPkg class]] ? have : nil;   // resolved as GPU-only before the CPU wrote it: dropped and rebuilt as packaged
         if (pk) {   // Already uploaded: check the covered pages only if there has been a guest write since the last check
+            pk->use_fence = g_fence;
             uint64_t now = nvn_dirty_now();
             int tracked = pk->span != NULL;   // kept from the upload: a texture's pool stays registered while the texture lives
             int clean = tracked && (now == pk->seen || !nvn_dirty_since_span(pk->span, t->mem, t->L.size, pk->stamp));
@@ -2159,6 +2161,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             if (pk->spare) { pthread_mutex_lock(&g_mu); uint64_t done = g_done; pthread_mutex_unlock(&g_mu); if (pk->spare_fence <= done && pk->spare.usage == pk->tex.usage) reuse = pk->spare; }
             uint64_t st, vg = nvn_sparse_gen(); id<MTLTexture> nt = pkg_upload(t, &st, reuse);
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt;
+                pk->use_fence = g_fence;
                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
                 if (pk->sparse) sparse_view(pk, t);
                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
@@ -2166,6 +2169,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             return pk->view ? pk->view : pk->tex;
         }
         pk = [NvPkg new];
+        pk->serial = t->serial; pk->use_fence = g_fence;
         pk->sparse = t->pool && nvn_sparse_pool(t->pool); pk->vgen = pk->vseen = nvn_sparse_gen();
         pk->tex = pkg_upload(t, &pk->stamp, nil);
         if (!pk->tex) return nil;
@@ -2222,10 +2226,173 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_put(t->serial, mt);
     return mt;
 }
+// Prune NvPkg spare textures that have been idle for >= 300 submissions
+static uint64_t g_spare_pruned_count, g_spare_pruned_bytes;
+static void pkg_prune_spares(void) {
+    uint64_t done;
+    pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_by_serial.cap; i++) {
+        if (!g_by_serial.vals[i]) continue;
+        id o = (__bridge id)g_by_serial.vals[i];
+        if ([o isKindOfClass:[NvPkg class]]) {
+            NvPkg *pk = (NvPkg *)o;
+            if (pk->spare && pk->spare_fence <= done && (done - pk->spare_fence >= 300)) {
+                g_spare_pruned_count++;
+                g_spare_pruned_bytes += pk->spare.allocatedSize;
+                defer_obj_release(pk->spare);
+                pk->spare = nil;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_smu);
+}
+
+// Under memory pressure (< 500 MB headroom on iOS, < 350 MB on tight 3GB devices, or DM_TEST_EVICT on Mac), evict packaged textures
+void mtl_vc_drop(uint64_t ser);
+static uint64_t g_pkg_evicted_count;
+static int g_no_increased_memory = -1;
+static uint64_t g_simulated_limit_bytes = 0;
+
+int dm_no_increased_memory(void) {
+    if (g_no_increased_memory >= 0) return g_no_increased_memory;
+#if TARGET_OS_IPHONE
+    task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    uint64_t fp = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) {
+        fp = vi.phys_footprint;
+    }
+    uint64_t avail = os_proc_available_memory();
+    uint64_t total = fp + avail;
+    // Free personal accounts on devices without increased-memory-limit have total <= 3072-3200 MB
+    if (total > 0 && total <= (3200ull << 20)) {
+        g_no_increased_memory = 1;
+        MLOG("[mem] detected device memory limit without increased-memory-limit entitlement: total ceiling %llu MB (enforcing proactive reclamation)", (unsigned long long)(total >> 20));
+    } else {
+        g_no_increased_memory = 0;
+    }
+#else
+    const char *lim_env = getenv("DM_TEST_MEM_LIMIT_MB");
+    if (lim_env && *lim_env) {
+        uint64_t mb = strtoull(lim_env, NULL, 10);
+        if (mb > 0) g_simulated_limit_bytes = mb << 20;
+    } else if (getenv("DM_TEST_NO_BC")) {
+        g_simulated_limit_bytes = 3072ull << 20; // Default 3072 MB simulation when testing no-BC path
+    }
+    g_no_increased_memory = (g_simulated_limit_bytes > 0);
+    if (g_no_increased_memory) {
+        MLOG("[mem] Mac simulating tight device limit (%llu MB ceiling)", (unsigned long long)(g_simulated_limit_bytes >> 20));
+    }
+#endif
+    return g_no_increased_memory;
+}
+
+static uint64_t get_headroom_bytes(uint64_t current_rss_mb) {
+#if TARGET_OS_IPHONE
+    return os_proc_available_memory();
+#else
+    if (g_simulated_limit_bytes > 0) {
+        uint64_t cur_bytes = current_rss_mb << 20;
+        return (g_simulated_limit_bytes > cur_bytes) ? (g_simulated_limit_bytes - cur_bytes) : 0;
+    }
+    return 10000ull << 20;
+#endif
+}
+
+static void pkg_prune_idle(uint64_t avail_bytes) {
+    int tight = dm_no_increased_memory();
+    uint64_t thresh_trigger = tight ? (350ull << 20) : (500ull << 20);
+    int under_pressure = (avail_bytes > 0 && avail_bytes < thresh_trigger);
+#if !TARGET_OS_IPHONE
+    if (getenv("DM_TEST_EVICT")) under_pressure = 1;
+#endif
+    if (!under_pressure) return;
+
+    uint64_t idle_thresh = 900; // default ~30s
+    int max_evict = 64;
+    if (avail_bytes < (180ull << 20)) {
+        idle_thresh = 120; // critical: ~4s
+        max_evict = 1024;
+    } else if (avail_bytes < (250ull << 20)) {
+        idle_thresh = 300; // high: ~10s
+        max_evict = 256;
+    } else if (tight) {
+        idle_thresh = 600; // moderate: ~20s
+        max_evict = 128;
+    }
+
+    uint64_t done;
+    pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
+
+    uint64_t *evict_serials = malloc(max_evict * sizeof(uint64_t));
+    if (!evict_serials) return;
+    uint32_t nevict = 0;
+
+    pthread_mutex_lock(&g_smu);
+    uint64_t cur_fence = g_fence;
+    for (uint32_t i = 0; i < g_by_serial.cap && (int)nevict < max_evict; i++) {
+        if (!g_by_serial.vals[i]) continue;
+        id o = (__bridge id)g_by_serial.vals[i];
+        if ([o isKindOfClass:[NvPkg class]]) {
+            NvPkg *pk = (NvPkg *)o;
+            if (pk->serial && cur_fence > pk->use_fence && (cur_fence - pk->use_fence >= idle_thresh) && pk->spare_fence <= done) {
+                evict_serials[nevict++] = pk->serial;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_smu);
+
+    for (uint32_t j = 0; j < nevict; j++) {
+        uint64_t ser = evict_serials[j];
+        serial_del(ser);
+        mtl_vc_drop(ser);
+        g_pkg_evicted_count++;
+    }
+    free(evict_serials);
+    if (nevict) MLOG("[nvn-mtl] memory pressure (%llu MB headroom): evicted %u idle textures (%llu in total)", (unsigned long long)(avail_bytes >> 20), nevict, (unsigned long long)g_pkg_evicted_count);
+}
+
+void mtl_check_memory_pressure(unsigned long long frame) {
+    if (!dm_no_increased_memory()) return;
+    static uint64_t last_check_frame = 0;
+    static int in_critical_mode = 0;
+    if (!in_critical_mode && frame - last_check_frame < 15) return;
+    last_check_frame = frame;
+
+    uint64_t rss_mb = 0;
+    task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) {
+        rss_mb = vi.phys_footprint >> 20;
+    }
+    uint64_t avail = get_headroom_bytes(rss_mb);
+
+#if !TARGET_OS_IPHONE
+    if (g_simulated_limit_bytes > 0 && (rss_mb << 20) > g_simulated_limit_bytes) {
+        LOG("[RED] memory watchdog: resident %llu MB over simulated device limit of %llu MB (frame %llu), simulated Jetsam kill",
+            (unsigned long long)rss_mb, (unsigned long long)(g_simulated_limit_bytes >> 20), (unsigned long long)frame);
+        _exit(86);
+    }
+#endif
+
+    if (avail < (350ull << 20)) {
+        in_critical_mode = 1;
+        pkg_prune_idle(avail);
+        if (avail < (180ull << 20)) {
+            pkg_prune_spares();
+        }
+    } else {
+        in_critical_mode = 0;
+    }
+}
+
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+    pkg_prune_spares();
+    uint64_t avail_bytes = get_headroom_bytes(rss_mb);
+    pkg_prune_idle(avail_bytes);
+
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
@@ -2233,9 +2400,16 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
     pthread_mutex_lock(&g_smu); unsigned ns = g_by_serial.n, ashared = g_alias.n, nghost = g_ghost.n; uint64_t ghost_puts = g_ghost_puts;
-    unsigned aorph = 0;   // shared textures no live texture object or finalized serial resolves to: kept only until their storage is taken over or their pool goes (alias_take_over)
+    unsigned aorph = 0, spare_n = 0; uint64_t spare_mb = 0;
     { CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL);
-      for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i]) CFSetAddValue(held, g_by_serial.vals[i]);
+      for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i]) {
+          CFSetAddValue(held, g_by_serial.vals[i]);
+          id o = (__bridge id)g_by_serial.vals[i];
+          if ([o isKindOfClass:[NvPkg class]]) {
+              NvPkg *pk = (NvPkg *)o;
+              if (pk->spare) { spare_n++; spare_mb += pk->spare.allocatedSize; }
+          }
+      }
       for (uint32_t i = 0; i < g_ghost.cap; i++) if (g_ghost.vals[i]) CFSetAddValue(held, g_ghost.vals[i]);
       for (uint32_t i = 0; i < g_alias.cap; i++) if (g_alias.vals[i] && !CFSetContainsValue(held, g_alias.vals[i])) aorph++;
       CFRelease(held); }
@@ -2260,10 +2434,15 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       }
     }
     char avail[32] = "none";
+    if (avail_bytes > 0) {
+        snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(avail_bytes >> 20));
+    }
 #if TARGET_OS_IPHONE
-    snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
+    else {
+        snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
+    }
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), spare textures alive %u (%llu MB; %llu pruned in total), idle textures evicted %llu in total, texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, spare_n, (unsigned long long)(spare_mb >> 20), (unsigned long long)g_spare_pruned_count, (unsigned long long)g_pkg_evicted_count, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed "

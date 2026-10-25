@@ -51,6 +51,19 @@ static void mem_init(void) {
 // Previously 3 GB was reported here and SetHeapSize never failed: the heap was about 150 MB smaller than on the real device, at the run entry peak the main heap had only about 18 MB left, and under high local load a timing shift made a 128 KB request return null,
 // which the guest writes to without a null check (CRASH main+0x1b36138, re-verified after merge with inv_tap).
 #define APP_POOL DM_GAME_APP_POOL   // game profile app_pool (Mario 0xCD500000)
+int dm_no_increased_memory(void);
+static inline uint64_t app_pool_limit(void) {
+    if (dm_no_increased_memory()) {
+        static uint64_t lim = 0;
+        if (!lim) {
+            const char *e = getenv("DM_APP_POOL_LIMIT_MB");
+            if (e && *e) lim = strtoull(e, NULL, 10) << 20;
+            else lim = 2750ull << 20; // 2750 MB pool (~530 MB alias room: safe headroom for all 7 maps)
+        }
+        return lim;
+    }
+    return (uint64_t)APP_POOL;
+}
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) n += g_mod[i].size; return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,
 // and the heap it opens = pool − 64 MB − 1.75 GB virtual address memory − 1 MB = 0x5be00000, as on hardware); Metroid Dread's main has about 1.8 GB of bss, the engine's static heap, which the Switch counts as used;
@@ -155,7 +168,10 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         int rc = 0;
         if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
-        else if (size < g_heap_cur) rc = mprotect(g_heap + size, g_heap_cur - size, PROT_NONE);
+        else if (size < g_heap_cur) {
+            void *p = mmap(g_heap + size, g_heap_cur - size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+            rc = (p == MAP_FAILED) ? -1 : 0;
+        }
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
         else if (size > g_heap_cur) LOG("[mem] heap %.2f GB (heap region %.2f GB)", size / 1073741824.0, g_heap_cap / 1073741824.0);
         g_heap_cur = size;
@@ -244,11 +260,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
         if (mem_map_limit_on() && num == 0x2C) {
             pthread_mutex_lock(&g_phys_mu);
-            int64_t need = alias_unmapped((uint64_t)(a - g_alias), size) << 12, room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);   // the pool less the used memory GetInfo reports
+            int64_t pool = (int64_t)app_pool_limit();
+            int64_t need = alias_unmapped((uint64_t)(a - g_alias), size) << 12, room = pool - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);   // the pool less the used memory GetInfo reports
             if (need > room) {
                 pthread_mutex_unlock(&g_phys_mu);
-                static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
-                                                                       size, atomic_load(&g_alias_mapped) / 1073741824.0);
+                static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool (%.2f GB) is full (ResultLimitReached, the SDK frees cached pages and retries)",
+                                                                       size, atomic_load(&g_alias_mapped) / 1073741824.0, pool / 1073741824.0);
                 regs[0] = 0x10801; return 0;
             }
         }
@@ -257,8 +274,15 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
         uintptr_t mlo = num == 0x2C ? lo & ~(pg - 1) : (lo + pg - 1) & ~(pg - 1), mhi = num == 0x2C ? (hi + pg - 1) & ~(pg - 1) : hi & ~(pg - 1);
         int rc = 0;
-        if (mhi > mlo) rc = num == 0x2C ? mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE)
-                                        : (madvise((void *)mlo, mhi - mlo, MADV_FREE), mprotect((void *)mlo, mhi - mlo, PROT_NONE));
+        if (mhi > mlo) {
+            if (num == 0x2C) {
+                rc = mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE);
+            } else {
+                // Instantly reclaim anonymous physical memory back to XNU via MAP_FIXED replacement
+                void *p = mmap((void *)mlo, mhi - mlo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+                rc = (p == MAP_FAILED) ? -1 : 0;
+            }
+        }
         if (rc) { if (mem_map_limit_on() && num == 0x2C) pthread_mutex_unlock(&g_phys_mu); die("SVC %#x mprotect %p+%#zx errno=%d", num, a, size, errno); }
         if (g_flag.svc) LOG("%sPhysicalMemory %p+%#zx", num == 0x2C ? "Map" : "Unmap", a, size);
         // how deep the alias region is used (one line per 256 MB crossed): for sizing the reservation and alias region (iOS caps a single reservation at 6 GB)

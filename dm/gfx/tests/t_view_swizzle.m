@@ -31,6 +31,25 @@ static void read_check(int tid, id<MTLTexture> view, const float expected[8], fl
     float *actual = output.contents;
     for (int i = 0; i < 8; i++) { if (fabsf(actual[i] - expected[i]) > tol) fprintf(stderr, "case %d component %d: got %g expected %g\n", tid, i, actual[i], expected[i]); CHECK(fabsf(actual[i] - expected[i]) <= tol, "sampled channel matches NVN format and mapping"); }
 }
+static void noalpha_3d_case(void) {
+    tex_t t = {.magic=MAGIC('T','E','X',0), .serial=98416};
+    t.d = (nvn_texdesc){.target=NVN_TEXTURE_TARGET_3D, .format=0x3f, .width=2, .height=2, .depth=2, .levels=1, .samples=1};
+    MTLTextureDescriptor *d = tex_desc(&t, 1); d.storageMode = MTLStorageModeShared;
+    id<MTLTexture> base = [g_dev newTextureWithDescriptor:d];
+    CHECK(base != nil, "RG11B10Float 3D texture created");
+    uint32_t pixels[8] = {0}; [base replaceRegion:MTLRegionMake3D(0, 0, 0, 2, 2, 2) mipmapLevel:0 slice:0 withBytes:pixels bytesPerRow:8 bytesPerImage:16];
+    serial_put(t.serial, base); mtl_reg_tex(416, &t, NULL);
+    pthread_mutex_lock(&g_rmu); id<MTLTexture> view = tex_by_id(416); pthread_mutex_unlock(&g_rmu);
+    CHECK(view != nil && view != base && view.textureType == MTLTextureType3D, "format alpha mapping makes a same-type sampled view");
+    CHECK(view.swizzle.alpha == MTLTextureSwizzleOne, "RG11B10Float sampled alpha is explicitly one");
+    id<MTLComputePipelineState> p = pipe_of(@"#include <metal_stdlib>\nusing namespace metal;\nkernel void sample_alpha(texture3d<float, access::read> t [[texture(0)]], device float *out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = t.read(uint3(i, 0, 0)).w; }\n", @"sample_alpha");
+    id<MTLBuffer> output = [g_dev newBufferWithLength:2 * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> command = q_cb(); id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:p]; [encoder setTexture:view atIndex:0]; [encoder setBuffer:output offset:0 atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(2, 1, 1)]; [encoder endEncoding]; [command commit]; [command waitUntilCompleted];
+    CHECK(command.status == MTLCommandBufferStatusCompleted, "RG11B10Float 3D alpha sample completed");
+    float *actual = output.contents; CHECK(fabsf(actual[0] - 1.f) < 0.001f && fabsf(actual[1] - 1.f) < 0.001f, "RG11B10Float 3D samples alpha as one");
+}
 // uploaded: as tex_mtl leaves a texture uploaded from guest memory, an NvPkg in the serial table, clean since its upload (no guest write since, so its pages are not looked at)
 static void swizzle_case(int tid, int format, int view_format, int uploaded, const void *pixels, unsigned bytes, const uint8_t *builder, const uint8_t *mapping, const float expected[8]) {
     tex_t t = {.magic=MAGIC('T','E','X',0), .serial=98000+(unsigned)tid};
@@ -116,6 +135,7 @@ int main(void) { @autoreleasepool {
     cleared_case(413, NVN_FORMAT_RGB565);
     cleared_case(414, NVN_FORMAT_BGR565);
     image_case(415);
+    noalpha_3d_case();
     printf("texture view swizzle: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 } }

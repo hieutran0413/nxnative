@@ -7,7 +7,7 @@ int main(void) {
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         printf("device %s\n", dev.name.UTF8String);
-        int mapped = 0, ok = 0, exact = 0, sub = 0, none = 0, bad_srgb = 0;
+        int mapped = 0, ok = 0, exact = 0, sub = 0, none = 0, bad_srgb = 0, bad_noalpha = 0;
         static const int srgb[] = {0x37, 0x38, 0x45, 0x46, 0x47, 0x48, 0x4E, 0x9B, 0x9C};
         for (int f = 0x01; f <= 0x9C; f++) {
             uint32_t m; uint8_t s[4]; int k = nvn_fmt_to_mtl(f, &m, s);
@@ -27,7 +27,12 @@ int main(void) {
             if (!(m == 71 || m == 81 || m == 131 || m == 133 || m == 135 || m == 153)) { printf("sRGB did not land on _sRGB: %#x → %u\n", srgb[i], m); bad_srgb++; }
         }
         for (int f = 0x87; f <= 0x94; f++) { uint32_t m; nvn_fmt_to_mtl(f, &m, NULL); if (m < 186 || m > 200) { printf("ASTC sRGB did not land on _sRGB: %#x → %u\n", f, m); bad_srgb++; } }
-        printf("mapped (nonzero): %d (exact %d, substitute %d), no match %d, total %d; actually created %d/%d; sRGB violations %d\n", mapped, exact, sub, none, 0x9C, ok, mapped, bad_srgb);
-        return (ok == mapped && !bad_srgb) ? 0 : 1;
+        static const int noalpha[] = {0x3F, 0x40, 0x41, 0x45};
+        for (unsigned i = 0; i < sizeof noalpha / sizeof *noalpha; i++) {
+            uint32_t m; uint8_t s[4]; nvn_fmt_to_mtl(noalpha[i], &m, s);
+            if (s[3] != NVN_SWZ_ONE) { printf("NVN %#x lacks alpha but maps alpha to %u\n", noalpha[i], s[3]); bad_noalpha++; }
+        }
+        printf("mapped (nonzero): %d (exact %d, substitute %d), no match %d, total %d; actually created %d/%d; sRGB violations %d; missing-alpha violations %d\n", mapped, exact, sub, none, 0x9C, ok, mapped, bad_srgb, bad_noalpha);
+        return (ok == mapped && !bad_srgb && !bad_noalpha) ? 0 : 1;
     }
 }

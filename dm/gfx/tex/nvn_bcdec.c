@@ -43,14 +43,16 @@ static void block(uint32_t f, const uint8_t *b, uint8_t *o, int op) {   // one b
 int nvn_bc_decode(uint32_t f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch) {
     uint32_t pf; int bpp; if (!nvn_bc_unpacked(f, &pf, &bpp)) return -1;
     int bb = (f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46 || f == 0x49 || f == 0x4a) ? 8 : 16;   // bytes per block
+    int opaque_bc1 = f == 0x41 || f == 0x45;   // RGB_DXT1 has no alpha channel; bcdec's shared BC1 decoder emits punch-through alpha for index 3
     uint8_t tmp[4 * 4 * 8];
     for (uint32_t by = 0; by * 4 < h; by++) for (uint32_t bx = 0; bx * 4 < w; bx++) {
         const uint8_t *b = src + by * pitch + bx * bb;
         uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4, ch = h - by * 4 < 4 ? h - by * 4 : 4;
         uint8_t *o = dst + (size_t)by * 4 * dpitch + (size_t)bx * 4 * bpp;
-        if (cw == 4 && ch == 4) { block(f, b, o, (int)dpitch); continue; }
-        block(f, b, tmp, 4 * bpp);   // blocks at the edge that are not a full 4×4: decode into a temporary block first, then copy the needed part
-        for (uint32_t y = 0; y < ch; y++) memcpy(o + y * dpitch, tmp + y * 4 * bpp, cw * bpp);
+        if (cw == 4 && ch == 4) block(f, b, o, (int)dpitch);
+        else { block(f, b, tmp, 4 * bpp);   // blocks at the edge that are not a full 4×4: decode into a temporary block first, then copy the needed part
+            for (uint32_t y = 0; y < ch; y++) memcpy(o + y * dpitch, tmp + y * 4 * bpp, cw * bpp); }
+        if (opaque_bc1) for (uint32_t y = 0; y < ch; y++) for (uint32_t x = 0; x < cw; x++) o[y * dpitch + x * 4 + 3] = 255;
     }
     return 0;
 }

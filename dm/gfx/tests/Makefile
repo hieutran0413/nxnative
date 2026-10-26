@@ -135,5 +135,11 @@ run: t_nvn t_dirty_slots t_dirty_race t_builtin t_vin t_tbuf2d t_deswz_gpu t_pac
 	MTL_DEBUG_LAYER=1 ./t_vk_desc
 	DM_GAME=$(GAME) python3 test_tbdr_budget.py
 .PHONY: run
-t_bcastc: t_bcastc.m ../tex/nvn_bcastc.c ../tex/nvn_bcastc.h ../tex/nvn_bcastc_msl.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h
+t_bcastc: t_bcastc.m ../tex/nvn_bcastc.c ../tex/nvn_bcastc.h ../tex/nvn_bcastc_msl.h ../tex/nvn_bc4rt_msl.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_bcastc.m ../tex/nvn_bcdec.c ../tex/nvn_bcastc.c -framework Metal -framework Foundation
+t_bcastc_mtl4: t_bcastc_mtl4.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_bcastc_mtl4.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_bcastc_mtl4
+check_t_bcastc_mtl4: t_bcastc_mtl4
+	MTL_DEBUG_LAYER=1 ./t_bcastc_mtl4
+run: check_t_bcastc_mtl4

@@ -1,5 +1,5 @@
 // NVNformat (nvn.h 0x01–0x9C) → Metal. The table is written entry by entry in NVN enum order; unlisted formats (including 0 and out of range) return 0.
-// Component remapping: "no alpha" formats such as RGBX / RGB_DXT1 read a as 1; RGB-family 16-bit packed formats swap r/b; all others are identity.
+// Component remapping: formats without stored alpha (RGBX, RGB9E5/RG11B10 and RGB_DXT1) read a as 1; RGB-family 16-bit packed formats swap r/b; all others are identity.
 // BC1–7 on iOS require GPU BC support (MTLDevice.supportsBCTextureCompression, iOS 16.4+; A19 supports it; device capability is not checked in this table).
 #include "nvn_fmt_mtl.h"
 
@@ -49,7 +49,7 @@ static const ent T[0x9D] = {
     // 16-bit packed formats: matched by name - the BGR family (0x95–0x98) maps directly to the same-named Metal format, the RGB family uses the same Metal format with r/b swapped.
     // The actual bit order of NVN vs Metal has not been verified with real data → all marked substitute; verify the bit order when a real texture is first encountered, then upgrade to exact
     [0x39] = S(ABGR4Unorm), SXR(BGR5A1Unorm), SR(BGR5A1Unorm), SR(B5G6R5Unorm),
-    [0x3D] = E(RGB10A2Unorm), E(RGB10A2Uint), E(RG11B10Float), E(RGB9E5Float),
+    [0x3D] = E(RGB10A2Unorm), E(RGB10A2Uint), X(RG11B10Float), X(RGB9E5Float),
     // DXT / RGTC / BPTC = BC1–7; RGB_DXT1 has no alpha
     [0x41] = X(BC1), E(BC1), E(BC2), E(BC3), X(BC1_sRGB), E(BC1_sRGB), E(BC2_sRGB), E(BC3_sRGB),
     [0x49] = E(BC4_U), E(BC4_S), E(BC5_U), E(BC5_S), E(BC7), E(BC7_sRGB), E(BC6H_S), E(BC6H_U),

@@ -76,6 +76,7 @@ void dm_guest_frame_tick(void);        // Called on every present (hle_nvn.c): w
 uint64_t dm_nvn_frame_count(void);
 uint64_t dm_nvn_sub_cpu_ns(void);     // Cumulative CPU nanoseconds of submit (excluding present)
 void dm_backtrace(uint64_t fp);
+size_t dm_backtrace_capture(uint64_t fp, uint64_t *frames, size_t cap);
 void crash_watch_progress(uint32_t tick, const char *stage);
 void crash_watch_frame(void);
 void crash_watch_pregame_done(void);
@@ -95,6 +96,7 @@ void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len));
 void dm_res_report_register(void (*fn)(uint32_t tick, const char *why));   // Resource count callback (registered by the graphics layer): called every 250 ticks, when the loading screen has been dismissed, and on exit when the record is full
 void (*dm_res_report_cb(void))(uint32_t tick, const char *why);   // Get the registered resource count callback (null if not registered)
 void dm_guest_write_prepare(void *addr, size_t len);
+void dm_memstat_wait_for_crossing_dump(void); // Diagnostic only: let the one-shot threshold VM snapshot finish before simulated Jetsam
 // Graphics lifecycle (hle_nvn.c): on=1 suspends (afterwards submit / present block, and in-flight GPU work is drained before returning), on=0 resumes; called by the iOS front end when entering and leaving the background
 void dm_gfx_suspend(int on);
 void dm_gfx_enter(void); void dm_gfx_leave(void);   // hle_nvn.c: the gate dm_gfx_suspend closes, for graphics layers other than NVN (dm/gfx/vk)

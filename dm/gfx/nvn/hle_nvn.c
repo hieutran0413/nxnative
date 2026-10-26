@@ -1691,6 +1691,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
         double up_ms = mtl_upload_ns_take() / 1e6; trow(f, "@upload_ms", up_ms);
         trow(f, "@upload_gpu_ms", mtl_upload_gpu_ns_take() / 1e6);
+        static uint64_t prev_upload_bytes; uint64_t upload_bytes = mtl_upload_bytes();
+        trow(f, "@upload_mb", upload_bytes >= prev_upload_bytes ? (upload_bytes - prev_upload_bytes) / 1048576.0 : 0);
+        prev_upload_bytes = upload_bytes;
         // Accounting: number of synchronous creations on the submit thread this frame + a timestamp on the same clock as UIMSG (offline, frames are split into front end / loading / in-run by the loading screen intervals)
         static uint64_t plib, ppso; uint64_t lib_, pso_; mtl_create_stats(&lib_, &pso_);
         trow(f, "@lib_new", (double)(lib_ - plib)); trow(f, "@pso_new", (double)(pso_ - ppso));

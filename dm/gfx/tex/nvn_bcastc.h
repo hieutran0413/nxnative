@@ -1,12 +1,14 @@
-// BC1 → ASTC 4x4 LDR block transcoding for GPUs without BC (A15 / A16 etc.): a BC1-family texture (NVN formats 0x41 0x42 0x45 0x46) is stored as ASTC 4x4 (1 byte per pixel) instead of RGBA8 (4 bytes per pixel).
-// Both formats have 4x4 blocks and a 4-colour palette on a line between two endpoints, so a block maps to one single-partition RGB-direct ASTC block with 8-bit endpoints and 2-bit weights:
-// the BC1 weights 0, 1/3, 2/3, 1 are the ASTC weights 0, 21, 43, 64 (of 64), within 1 of the decoded 8-bit value. 3-colour blocks (c0 <= c1) lose their midpoint (kept at 1/3) and their transparent index (drawn as the darker endpoint, alpha 1).
+// BC1 → ASTC 4x4 LDR block transcode for GPUs without BC. Four-colour blocks use 4-level weights; opaque three-colour blocks without selector 3 use 5-level weights so their midpoint is represented within the test's 2-level bound.
+// Blocks with selector 3 must use exact fallback. In RGB_DXT1 it is opaque black; in RGBA_DXT1 it is transparent. Neither is represented by this RGB-direct block.
 // The Metal kernel in nvn_bcastc_msl.h implements the same transcoding.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 
-// One BC1 block (8 bytes) → one ASTC block (16 bytes). Returns 1 when the block is a 3-colour block that uses the transparent index (its alpha is lost), else 0
+// Return 1 when all three-colour blocks avoid selector 3; four-colour blocks are representable within the tested color bound.
+int nvn_bc1_astc_safe(const uint8_t *bc, size_t pitch, uint32_t w, uint32_t h);
+// One BC1 block (8 bytes) → one ASTC block (16 bytes). Returns 1 when a 3-colour block uses index 3, which is RGB black or RGBA punch-through alpha and requires exact fallback.
 int nvn_bc1_astc_block(const uint8_t *bc, uint8_t *astc);
-// A w×h pixel region: src is laid out by block rows (pitch bytes per block row), dst by block rows of dpitch bytes (at least ceil(w/4) * 16). Returns the number of blocks with a lost transparent index
+// A w×h pixel region: src is laid out by block rows (pitch bytes per block row), dst by block rows of dpitch bytes (at least ceil(w/4) * 16). Returns the number of blocks with an unfaithful index 3.
 size_t nvn_bc1_astc(const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch);
+const uint8_t *nvn_bc1_astc_quint_lut(size_t *size);

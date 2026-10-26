@@ -80,16 +80,22 @@ void crash_off(const char *tag, uint64_t a) {   // Also used by diag.c
 // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked.
 // Each frame is read with vm_read_overwrite, which fails instead of faulting: code built without frame pointers keeps data in x29 (STEINS;GATE RE:BOOT's main+0x38921c: x29 = 0x430),
 // and a probe's backtrace there used to crash the host
-void dm_backtrace(uint64_t fp) {
-    fprintf(stderr, "[dm] bt:");
-    for (int i = 0; i < 32 && fp && !(fp & 7); i++) {
+size_t dm_backtrace_capture(uint64_t fp, uint64_t *frames, size_t cap) {
+    size_t nframe = 0;
+    for (; nframe < cap && fp && !(fp & 7); ) {
         uint64_t w[2]; vm_size_t got = 0;
         if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) break;
         uint64_t nfp = w[0], ra = w[1];
-        off("", ra);
+        frames[nframe++] = ra;
         if (nfp <= fp) break;
         fp = nfp;
     }
+    return nframe;
+}
+void dm_backtrace(uint64_t fp) {
+    uint64_t frames[32]; size_t n = dm_backtrace_capture(fp, frames, sizeof frames / sizeof frames[0]);
+    fprintf(stderr, "[dm] bt:");
+    for (size_t i = 0; i < n; i++) off("", frames[i]);
     fputc('\n', stderr);
 }
 // ---------- Page fault hooks (write-protect dirty page tracking) ----------

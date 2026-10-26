@@ -22,6 +22,7 @@ static uint8_t *g_heap; static size_t g_heap_cur, g_heap_cap;
 int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }
 static uint8_t *g_alias; static size_t g_alias_cap;
 static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_pages)
+static int g_alias_trace_enabled;
 static uint8_t *g_stack; static size_t g_stack_cap;
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
@@ -29,6 +30,8 @@ int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_
 static void *alias_windows_thread(void *arg);
 static void mem_init(void) {
     if (g_as) return;
+    const char *alias_trace = getenv("DM_ALIAS_TRACE");
+    g_alias_trace_enabled = alias_trace && *alias_trace && strcmp(alias_trace, "0");
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
@@ -65,6 +68,16 @@ static inline uint64_t app_pool_limit(void) {
     return (uint64_t)APP_POOL;
 }
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) n += g_mod[i].size; return (n + 0x1fffff) & ~(size_t)0x1fffff; }
+// Diagnostic-only Mac override: make the guest size its own allocations for a smaller app-memory budget
+// without changing the host's physical-map cap. This is separate from DM_APP_POOL_LIMIT_MB, which can
+// provoke ResultLimitReached after the game has already committed its fixed heap.
+static uint64_t app_total_memory(void) {
+#if !TARGET_OS_IPHONE
+    const char *e = getenv("DM_NVN_TEST_TOTAL_MEM_MB");
+    if (e && *e) { uint64_t mb = strtoull(e, NULL, 10); if (mb > 0) return mb << 20; }
+#endif
+    return (uint64_t)APP_POOL;
+}
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,
 // and the heap it opens = pool − 64 MB − 1.75 GB virtual address memory − 1 MB = 0x5be00000, as on hardware); Metroid Dread's main has about 1.8 GB of bss, the engine's static heap, which the Switch counts as used;
 // without it the game asks for pool − 64 MB = 3.15 GB of heap
@@ -72,6 +85,14 @@ static size_t big_bss_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i+
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = RESERVE; }
+// Stable guest subranges for VM accounting. heap_cap is the reserved heap range;
+// resident pages, rather than the current protection boundary, report actual use.
+void svc_guest_ranges(uint8_t **heap, size_t *heap_size, uint8_t **alias, size_t *alias_size,
+                      uint8_t **stack, size_t *stack_size) {
+    *heap = g_heap; *heap_size = g_heap_cap;
+    *alias = g_alias; *alias_size = g_alias_cap;
+    *stack = g_stack; *stack_size = g_stack_cap;
+}
 
 int dm_no_increased_memory(void);
 static inline int mem_map_limit_on(void) {
@@ -129,7 +150,89 @@ static int64_t alias_unmapped(uint64_t off, uint64_t n) {
     return c;
 }
 static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (page bitmap)
+#if !TARGET_OS_IPHONE
+static _Atomic int64_t g_alias_peak;     // high-water mark; diagnostic only
+static _Atomic uint64_t g_alias_map_calls, g_alias_unmap_calls, g_alias_map_bytes, g_alias_unmap_bytes;
+#endif
 static pthread_mutex_t g_phys_mu = PTHREAD_MUTEX_INITIALIZER;   // mem_map_limit: the pool check and the map it allows are one step
+
+// Optional, benchmark-only map ledger. It intentionally avoids task_info and
+// per-event fsync; correlate monotonic_ns with memstat's lightweight sampler.
+static pthread_mutex_t g_alias_trace_mu = PTHREAD_MUTEX_INITIALIZER;
+static FILE *g_alias_trace;
+static FILE *g_alias_stack_trace;
+static unsigned g_alias_trace_batch;
+static _Atomic uint64_t g_alias_trace_next_bt = 512ull << 20;
+#define ALIAS_TRACE_STACKS 128
+#define ALIAS_TRACE_FRAMES 6
+typedef struct { uint64_t pc[ALIAS_TRACE_FRAMES]; size_t n; } alias_trace_stack;
+static alias_trace_stack g_alias_trace_stacks[ALIAS_TRACE_STACKS];
+static unsigned g_alias_trace_stack_n;
+static void alias_trace_event(int map, uint64_t off, uint64_t size, int64_t delta, int64_t mapped,
+                              uint64_t caller_lr, uint64_t guest_fp) {
+    if (!g_alias_trace_enabled) return;
+    module_t *gate = module_of((void *)caller_lr);
+    const char *gate_name = gate ? gate->name : "?";
+    uint64_t gate_off = gate ? caller_lr - (uint64_t)(uintptr_t)gate->base : caller_lr;
+    uint64_t frames[ALIAS_TRACE_FRAMES] = {0};
+    size_t nframes = dm_backtrace_capture(guest_fp, frames, ALIAS_TRACE_FRAMES);
+    unsigned stack_id = 0;
+    pthread_mutex_lock(&g_alias_trace_mu);
+    if (!g_alias_trace) {
+        const char *base = getenv("DM_MEMSTAT");
+        if (!base || !*base) { pthread_mutex_unlock(&g_alias_trace_mu); return; }
+        char path[1200]; snprintf(path, sizeof path, "%s.alias.tsv", base);
+        g_alias_trace = fopen(path, "w");
+        if (!g_alias_trace) { pthread_mutex_unlock(&g_alias_trace_mu); return; }
+        fprintf(g_alias_trace, "monotonic_ns\top\toffset\trequested_bytes\tchanged_bytes\tmapped_bytes\theap_bytes\tsvc_gate_module\tsvc_gate_offset\tstack_id\n");
+        snprintf(path, sizeof path, "%s.alias-stacks.tsv", base);
+        g_alias_stack_trace = fopen(path, "w");
+        if (g_alias_stack_trace) fprintf(g_alias_stack_trace, "stack_id\tframe_count\tframes_module_plus_offset\n");
+    }
+    for (unsigned i = 0; i < g_alias_trace_stack_n; i++)
+        if (g_alias_trace_stacks[i].n == nframes && !memcmp(g_alias_trace_stacks[i].pc, frames, nframes * sizeof frames[0])) { stack_id = i + 1; break; }
+    if (!stack_id && nframes && g_alias_trace_stack_n < ALIAS_TRACE_STACKS) {
+        unsigned i = g_alias_trace_stack_n++;
+        g_alias_trace_stacks[i].n = nframes;
+        memcpy(g_alias_trace_stacks[i].pc, frames, nframes * sizeof frames[0]);
+        stack_id = i + 1;
+        if (g_alias_stack_trace) {
+            fprintf(g_alias_stack_trace, "%u\t%zu\t", stack_id, nframes);
+            for (size_t j = 0; j < nframes; j++) {
+                module_t *m = module_of((void *)frames[j]);
+                fprintf(g_alias_stack_trace, "%s+%#llx%s", m ? m->name : "?",
+                        (unsigned long long)(m ? frames[j] - (uint64_t)(uintptr_t)m->base : frames[j]), j + 1 == nframes ? "" : " ");
+            }
+            fputc('\n', g_alias_stack_trace); fflush(g_alias_stack_trace);
+        }
+    }
+    fprintf(g_alias_trace, "%llu\t%s\t%#llx\t%llu\t%lld\t%lld\t%zu\t%s\t%#llx\t%u\n",
+            (unsigned long long)now_ns(), map ? "map" : "unmap", (unsigned long long)off,
+            (unsigned long long)size, (long long)delta, (long long)mapped, g_heap_cur,
+            gate_name, (unsigned long long)gate_off, stack_id);
+    if (++g_alias_trace_batch >= 64 || !map) { fflush(g_alias_trace); g_alias_trace_batch = 0; }
+    pthread_mutex_unlock(&g_alias_trace_mu);
+    if (map) {
+        uint64_t next = atomic_load(&g_alias_trace_next_bt);
+        while ((uint64_t)mapped >= next) {
+            if (!atomic_compare_exchange_weak(&g_alias_trace_next_bt, &next, next + (64ull << 20))) {
+                next = atomic_load(&g_alias_trace_next_bt);
+                continue;
+            }
+            LOG("[mem] alias trace mapped high-water crossed %llu MiB; guest stack:", (unsigned long long)(next >> 20));
+            dm_backtrace(guest_fp);
+            next += 64ull << 20;
+        }
+    }
+}
+
+#if !TARGET_OS_IPHONE
+void svc_alias_map_stats(uint64_t *mapped, uint64_t *peak, uint64_t *map_calls, uint64_t *unmap_calls, uint64_t *map_bytes, uint64_t *unmap_bytes) {
+    *mapped = (uint64_t)atomic_load(&g_alias_mapped); *peak = (uint64_t)atomic_load(&g_alias_peak);
+    *map_calls = atomic_load(&g_alias_map_calls); *unmap_calls = atomic_load(&g_alias_unmap_calls);
+    *map_bytes = atomic_load(&g_alias_map_bytes); *unmap_bytes = atomic_load(&g_alias_unmap_bytes);
+}
+#endif
 
 // Diagnostic DM_ALIAS_WINDOWS=<window MB>: every 30 s, the mapped memory of each window of that size in the alias region (windows aligned to the size in absolute addresses, counted from the page
 // bitmap; windows with nothing mapped are left out). For sizing an allocator that reserves fixed, aligned windows and commits pages from each window's start: Unreal's FMallocBinned3 takes
@@ -159,11 +262,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base
         size_t size = regs[1];
         if (size > g_heap_cap) { LOG("SetHeapSize OOM: req %#zx > cap %#zx", size, g_heap_cap); regs[0] = 0xD401; return 0; }
-        if (size + image_bytes() > APP_POOL) {   // exceeds the application memory pool: ResultLimitReached. At startup the game retries in 2 MB decrements until it fits (main+0x1b66184)
+        uint64_t total_mem = app_total_memory();
+        if (size + image_bytes() > total_mem) {   // exceeds the application memory pool: ResultLimitReached. At startup the game retries in 2 MB decrements until it fits (main+0x1b66184)
             // Logged once (Mario's retries would repeat it): a game that sizes its heap as pool − used memory and does not retry stops here when its modules are larger than the used memory reported
             // (profile mem_used; the NSP script's probe boot reads this line, and sets mem_used when no SetHeapSize succeeds afterwards)
             static int once; if (!once++) LOG("[mem] SetHeapSize %#zx + modules %#zx > app pool %#llx (used memory reported %#llx + bss %#zx)", size, image_bytes() - big_bss_bytes(),
-                                              (unsigned long long)APP_POOL, (unsigned long long)DM_GAME_MEM_USED, big_bss_bytes());
+                                              (unsigned long long)total_mem, (unsigned long long)DM_GAME_MEM_USED, big_bss_bytes());
             regs[0] = 0x10801; return 0;
         }
         int rc = 0;
@@ -292,6 +396,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Total actually mapped in the alias region (one line per 256 MB crossed, up or down): how much physical memory the game uses and whether it keeps growing. Counted with a page bitmap, only pages whose state really changed --
         // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
         { int64_t d = alias_pages((uint64_t)(a - g_alias), size, num == 0x2C) << 12, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
+#if !TARGET_OS_IPHONE
+          if (num == 0x2C) {
+              atomic_fetch_add(&g_alias_map_calls, 1); atomic_fetch_add(&g_alias_map_bytes, (uint64_t)d);
+              int64_t peak = atomic_load(&g_alias_peak); while (after > peak && !atomic_compare_exchange_weak(&g_alias_peak, &peak, after)) {}
+          } else { atomic_fetch_add(&g_alias_unmap_calls, 1); atomic_fetch_add(&g_alias_unmap_bytes, (uint64_t)-d); }
+#endif
+          alias_trace_event(num == 0x2C, (uint64_t)(a - g_alias), size, d, after, regs[30], regs[29]);
           if (mem_map_limit_on() && num == 0x2C) pthread_mutex_unlock(&g_phys_mu);
           if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
         regs[0] = 0; return 0;
@@ -319,7 +430,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_HeapAddr:  v = (uint64_t)g_heap;  break;   case I_HeapSize:  v = g_heap_cap;  break;
         case I_AslrAddr:  v = (uint64_t)g_as;    break;   case I_AslrSize:  v = RESERVE;     break;
         case I_StackAddr: v = (uint64_t)g_stack; break;   case I_StackSize: v = g_stack_cap; break;
-        case I_TotalMem: case I_TotalNonSys: v = APP_POOL; break;
+        case I_TotalMem: case I_TotalNonSys: v = app_total_memory(); break;
         case I_UsedMem:  case I_UsedNonSys:  v = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
                                              // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)
                                              if (mem_map_limit_on()) v += (uint64_t)atomic_load(&g_alias_mapped); break;

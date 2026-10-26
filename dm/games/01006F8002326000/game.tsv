@@ -53,3 +53,7 @@ render_cond	on
 # The game asks for present interval 2 (30 fps); with a 60 fps exefs patch its logic steps per frame, so following that interval played at half speed on the iPad.
 # One frame per display tick, as the Mac runs it with DM_PRESENT_INTERVAL=display
 present_interval	display
+# Graphics stability on Apple Silicon / A16 Metal:
+# Animated video backdrop surfaces and billboard textures require lossless BC decoding (DM_NO_BC_ASTC=0)
+# and render pass feedback snapshotting (DM_NVN_FB_SNAP=all) to eliminate magenta shader artifacts.
+# Managed via dm/games/01006F8002326000/env.txt bundled as dm/env.txt in IPA.

@@ -18,7 +18,7 @@ Block linear is how the Tegra X1 GPU stores textures: the data is not one row af
 | `nvn_bcdec.h`, `nvn_bcdec.c` | `nvn_bc_unpacked()` / `nvn_bc_decode()`: decompress BC textures on the CPU into uncompressed formats; decoding uses `dm/third_party/bcdec` |
 | `tests/` | Unit tests |
 
-The offsets of each level and layer within the storage, and the block height and block depth actually used by each level, are all taken from `../nvn/nvn_tex.c` (`nvn_tex_layout`, `nvn_tex_level_offset`, `nvn_tex_level_tiles`); this directory only does addressing and moving within a level. The game's packaged textures carry their own layout parameters, whose byte 0 is the log2 of the level 0 block height; when it is present it takes precedence (the `pkg_block_h` field of `nvn_texdesc`).
+The offsets of each level and layer within the storage, and the block height and block depth actually used by each level, are all taken from `../nvn/nvn_tex.c` (`nvn_tex_layout`, `nvn_tex_level_offset`, `nvn_tex_level_tiles`); this directory only does addressing and moving within a level. Packaged parameters override the automatic block dimensions: [Packaged texture block dimensions and linear storage rows](../../../docs/reference/nvn-objects.md#packaged-texture-block-dimensions-and-linear-storage-rows).
 
 ## Devices without BC support
 
@@ -42,6 +42,7 @@ make -C dm/gfx/tex/tests run       # run t_fmt_mtl and t_tex
   |---|---|
   | A round trip | Writes random data into each level and layer and reads it back out; must be byte-for-byte equal. Covers 2D, 2D array and 3D, several bytes-per-block values and non-power-of-two sizes |
   | B address formula | The result of `nvn_bl_offset()` equals the address computed by hand from the public layout rules |
+  | D differential copies | Both copy directions match a byte-address oracle for 1,029 deterministic layouts, including padded pitches, byte tails, sparse mip tails, packaged block dimensions, arrays and cubes; untouched storage and row padding are compared too |
   | E hand-made 3D | Places markers at hand-computed addresses, checks where they land after deswizzling, and checks block height, block depth and storage size |
 
   The A round trip can only prove "one-to-one and within bounds"; it cannot prove that the layout formula is right. What backs it up is the hand-computed addresses of groups B and E, and the games that render right.

@@ -101,14 +101,8 @@ const char *front_ios_boot_message(void) { return g_boot_message[0] ? g_boot_mes
 // GitHub issue #704), so the screen says so instead of Metal aborting at the game's first BC texture. NULL on a supported device. Called by startGame (front_ios.m) once the launcher has set
 // its switches: this makes the process's first Metal device, and Metal reads MTL_HUD_ENABLED then; checked at launch, it kept the launcher's Performance HUD off (GitHub issue #840)
 const char *front_ios_device_check(void) {
-    static char msg[320]; static int done;
-    if (done++) return msg[0] ? msg : NULL;
-    id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
-    if (gpu.supportsBCTextureCompression) return NULL;
-    snprintf(msg, sizeof msg, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
-             gpu ? gpu.name.UTF8String : "no Metal device");
-    fprintf(stderr, "[RED] boot: %s\n", msg);
-    return msg;
+    // Supported via no-BC software / compute fallback on A16 and older
+    return NULL;
 }
 static void romfs_identity_report(NSString *doc) {
     romfs_id want, got;

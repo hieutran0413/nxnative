@@ -57,6 +57,7 @@ static size_t tex_size(int fmt, int w, int h, int flags, size_t *align) {
 }
 
 int main(void) {
+    setenv("DM_NVN_COUNT", "1", 1);   // the call-count checks below need the counting trampolines (off by default)
     // Engine-native limiters have no FPS state page. Their launcher cap must
     // still pace presents and select the display-link rate in display mode.
     { win_t w={.interval=1};nvn_present_config(60,1);dm_fps_state=NULL;
@@ -71,6 +72,17 @@ int main(void) {
       setenv("DM_FPS_TARGET","0",1);g_present_cap=-1;w.interval=2;
       EXPECT("no cap preserves display pacing",1,present_itv(&w));nvn_present_config(60,0);
       EXPECT("no cap preserves game pacing",2,present_itv(&w));
+      // the 30 Hz link only for even intervals: interval 3 (20 fps) has no whole number of 30 Hz ticks and stays on the 60 Hz link
+      w.interval=1;present_period(&w);w.interval=2;present_period(&w);g_itv2_since=(now_ns()-2000000000ull)|1;
+      EXPECT("interval 2 held a second: 30 Hz link",30,nvn_game_fps());
+      w.interval=3;present_period(&w);
+      EXPECT("interval 3: 60 Hz link",60,nvn_game_fps());
+      w.interval=4;present_period(&w);g_itv2_since=(now_ns()-2000000000ull)|1;
+      EXPECT("interval 4 held a second: 30 Hz link",30,nvn_game_fps());
+      w.interval=2;present_period(&w);
+      EXPECT("4 to 2 keeps the run",30,nvn_game_fps());
+      w.interval=3;present_period(&w);w.interval=2;present_period(&w);
+      EXPECT("back to 2 from 3 waits a second again",60,nvn_game_fps());
       _Alignas(8) uint8_t state[64]={0};float cap=60;memcpy(state,&cap,4);dm_fps_state=state;
       EXPECT("stub state takes precedence over env",60,fps_present_cap());
       *(uint32_t *)(state+4)=1;
@@ -112,9 +124,9 @@ int main(void) {
     P(nvnDeviceGetInteger)(&dev, (NVNdeviceInfo)0x30, &v); EXPECT("newest GPU code minor", 16, v);
     P(nvnDeviceGetInteger)(&dev, (NVNdeviceInfo)0x2F, &v); EXPECT("oldest GPU code major", 1, v);
     P(nvnDeviceGetInteger)(&dev, (NVNdeviceInfo)0x31, &v); EXPECT("oldest GPU code minor", 5, v);
-    // The Switch 2 table (NVN2's own constants, read from Donkey Kong Bananza's sdk): its GPU code range and Ampere's limits, the host's 16 vertex slots, and the run-time items
-    EXPECT("NVN2: API 231.30", 231 * 100 + 30, g_devinfo2[0] * 100 + g_devinfo2[1]);
-    EXPECT("NVN2: GPU code 201.0 to 201.17", 1, g_devinfo2[0x2E] == 201 && g_devinfo2[0x30] == 17 && g_devinfo2[0x2F] == 201 && g_devinfo2[0x31] == 0);
+    // The Switch 2 table (NVN2's own constants: the newest seen, SDK 21.4.4's, as an older sdk's own switch answers its older versions through dm_sdk_nvn2_item): its GPU code range and Ampere's limits, the host's 16 vertex slots, and the run-time items
+    EXPECT("NVN2: API 231.39", 231 * 100 + 39, g_devinfo2[0] * 100 + g_devinfo2[1]);
+    EXPECT("NVN2: GPU code 201.0 to 201.20", 1, g_devinfo2[0x2E] == 201 && g_devinfo2[0x30] == 20 && g_devinfo2[0x2F] == 201 && g_devinfo2[0x31] == 0);
     EXPECT("NVN2: 1,024 compute threads, an unbounded dispatch width", 1, g_devinfo2[0x1F] == 1024 && g_devinfo2[0x20] == 2147483647);
     EXPECT("NVN2: the host's 16 vertex bindings and attributes, not Ampere's 32", 1, g_devinfo2[0x06] == 16 && g_devinfo2[0x0E] == 16);
     EXPECT("NVN2: the memory pool page size is read at run time", DEVINFO_RT, g_devinfo2[NVN_DEVICE_INFO_MEMORY_POOL_PAGE_SIZE]);
@@ -213,6 +225,9 @@ int main(void) {
     {
         NVNtextureBuilder tb; NVNtexture original = {0}, replacement = {0};
         P(nvnTextureBuilderSetDevice)(&tb, &dev); P(nvnTextureBuilderSetDefaults)(&tb);
+        NVNtextureSwizzle swz[4] = {0};
+        P(nvnTextureBuilderGetSwizzle)(&tb, &swz[0], &swz[1], &swz[2], &swz[3]);
+        EXPECT("TextureBuilderGetSwizzle default identity", 1, swz[0] == 2 && swz[1] == 3 && swz[2] == 4 && swz[3] == 5);
         P(nvnTextureBuilderSetSize2D)(&tb, 4, 4);
         P(nvnTextureBuilderSetFormat)(&tb, NVN_FORMAT_R8);
         P(nvnTextureBuilderSetStorage)(&tb, &pool, 0);
@@ -222,6 +237,8 @@ int main(void) {
         EXPECT("TextureCompare implicit/explicit identity", 1, P(nvnTextureCompare)(&original, &replacement));
         P(nvnTextureFinalize)(&replacement);
         P(nvnTextureBuilderSetSwizzle)(&tb, 1, 1, 1, 2);
+        P(nvnTextureBuilderGetSwizzle)(&tb, &swz[0], &swz[1], &swz[2], &swz[3]);
+        EXPECT("TextureBuilderGetSwizzle reads what was set", 1, swz[0] == 1 && swz[1] == 1 && swz[2] == 1 && swz[3] == 2);
         P(nvnTextureInitialize)(&replacement, &tb);
         EXPECT("TextureCompare A8 channel replacement", 0, P(nvnTextureCompare)(&original, &replacement));
         EXPECT("TextureCompare channel replacement symmetric", 0, P(nvnTextureCompare)(&replacement, &original));
@@ -913,6 +930,9 @@ int main(void) {
     ((void (*)(void *))proc("nvnBufferBuilderGetDevice"))(NULL); ((void (*)(void *))proc("nvnBufferBuilderGetDevice"))(NULL);
     EXPECT("unimplemented function marked as reported ([RED]) after a call", 1, g_unimpl_seen[ui] > 0);
     EXPECT("unimplemented function count 2", 2, nvn_slot[ui].cnt);
+    for (int i = 0; i < 254; i++) ((void (*)(void *))proc("nvnBufferBuilderGetDevice"))(NULL);   // the 256th call is where a one-byte count wrapped to 0, and the next call reported again
+    EXPECT("unimplemented function count 256", 256, nvn_slot[ui].cnt);
+    EXPECT("unimplemented function stays reported past 256 calls", 1, g_unimpl_seen[ui]);
 
     // 8. A texture buffer as 2D rows for wrapped 1D fetches (x & 0x3FFF, x >> 14; nvn_mtl.m tbuf_as_2d): full rows back to back, one short row rounded to the alignment
     {

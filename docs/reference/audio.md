@@ -29,9 +29,16 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** both forms go through one open that starts the thread (`hle_audren.c` `ar_open`).
 - **Found on:** [Balatro](../../dm/games/0100CD801CE5E000/README.md) (SDK 18.3.2, LÖVE's OpenAL Soft; one boot).
 
+### A game with more than one renderer
+
+- **Symptom:** `[RED] audren: a second renderer (the host drives only one)` with different parameters from the first open; later, `catch-up renders so far` in the thousands (7,625 in 6 minutes), about 10% of the first renderer's frames.
+- **Cause:** a game may open several renderers, as on Horizon. The host kept one set of globals: the second renderer got no render thread, but `AudioRenderSystem::Update` is one hook for all of them, so each update of the second renderer found nothing rendered since the last, rendered a catch-up frame of the second renderer and queued it in the first one's output, in place of a frame of its own.
+- **Fix:** `hle_audren.c` keeps each renderer's state in `ar_t`: its render thread, output, catch-up queue, counters and upsampler history. Two renderers play through two outputs, which the sound card mixes. An SDK call that names only the `AudioRenderSystem` finds its renderer by `ar_of_sys`. One lock still serializes all rendering, since the header layout is decided once, from the first list, by trying each layout in turn; a frame takes about 0.02 ms. Catch-up renders went from 7,625 to 0 or 1 in a run. `dm/host/tests/t_audren_layout.c` checks the lookup and the upsampler's separate history.
+- **Found on:** [Mario & Luigi: Brothership](../../dm/games/01006D0017F7A000/README.md) (SDK 12.3.2): one renderer at 48 kHz, which sounds during the movie, and Unreal's mixer at 32 kHz.
+
 ### The SDK's open with an event calls the open without one (`t_in_open`)
 
-- **Symptom:** `[RED] audren: a second renderer` right after the first open, with the same work buffer and "original device 1 mode 1".
+- **Symptom:** `audren: OpenAudioRenderer` logged twice right after the first open, with the same work buffer and "original device 1 mode 1", and a second render thread (until 2026-11-04 the second log line was `[RED] audren: a second renderer`, which now means [more than one renderer](#a-game-with-more-than-one-renderer)).
 - **Cause:** not a second renderer: SDK 17.5.3's `OpenAudioRenderer` with an event opens it by calling the form without one through the PLT (`sdk+0x1e489c`), which the loader binds to the host's hook since that form has one ([A renderer opened without an event](#a-renderer-opened-without-an-event)), so `ar_open` ran twice for one renderer. The inner call started the render thread before the outer one had created the event, and the outer call took the renderer for a second one.
 - **Fix:** a thread-local flag (`t_in_open`) hands the inner call straight to the SDK with the host's CPU / manual copy of the parameter, and only the outer call starts the thread (`hle_audren.c`).
 - **Found on:** [ROMANCE OF THE THREE KINGDOMS 8 REMAKE](../../dm/games/0100C2A01A730000/README.md) (SDK 17.5.3).
@@ -231,6 +238,15 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
   - a watchdog in `hle_audio.c` switches any started output whose device has not called back for 200 ms in focus to the silent sink, retrying the AudioUnit after 1, 2, 4, 8 s. A start that fails (session still held by a call) falls back the same way instead of aborting.
 - **Check:** the log shows `audio session: interrupted`, `the device has not called back for N ms` and `AudioUnit restarted`. `tests/t_audio.c` (in `dm/host`) scenario 3 stops a playing AudioUnit behind the host's back.
 
+### A blocked audio device start freezes the game
+
+- **Symptom:** a game stops advancing while the Mac's selected output refuses to play. A process sample shows `AudioOutputUnitStart` waiting in the HAL, with the game's audio renderer waiting for a released PCM buffer.
+- **Cause:** Start and the watchdog's retries stopped the silent sink and waited for the device while holding the output registry lock. A driver could block there for seconds or return success without delivering any callbacks.
+- **Fix:** the silent sink paces the guest at 48 kHz while a host worker starts the device. Until the watchdog sees a callback after startup and joins the silent sink, the device returns silence. A device that fails to deliver its first callback within one second is stopped and retried with backoff. Each output can start independently. A Close during a start that the driver still holds returns at once: it unregisters the output, and the start's worker stops and disposes the unit and frees the output when the driver returns (waiting for it in Close held the game's thread as long as the driver blocked).
+- **Check:** `tests/t_audio_device.c` (in `dm/host`) blocks the mock driver's `AudioOutputUnitStart`: Start returns and the queued buffer is released, callbacks play silence until the handoff, and Stop / suspend / reset / Close each run while the start is still blocked.
+- **Open:** `AudioOutputUnitStop` still runs under `g_aos_lock` (Stop, suspend, the media services reset, the watchdog's stall path). A driver that blocked there as it does in Start would hold the lock; not seen so far.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md), with an unavailable HDMI audio output on the Mac ([issue #1030](https://github.com/seedds/nxnative/issues/1030)).
+
 ### AudioUnit construction before output publication
 
 - **Symptom:** TSan reports `au_create` writing `a->au` while `au_watchdog` reads it under `g_aos_lock` when a second real output opens (issue #410).
@@ -274,6 +290,13 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** the volume `SetAudioDeviceOutputVolume` sets is now kept and read back (`hle_audren.c`). `audio::GetAudioOutName` is hooked too.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (SDK 19.3.1, Unreal Engine 4.27: `GetAudioDeviceOutputVolume`); [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md) (SDK 11: `GetAudioOutName`).
 - **Note:** older SDKs name some device calls differently (`ListAudioDeviceName` / `GetActiveAudioDeviceName`, `OpenDefaultAudioOut` in SDK 12; [Older SDK names for the same calls](services.md#older-sdk-names-for-the-same-calls)), and [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (SDK 7) aborted in `audio::AcquireAudioDeviceSwitchNotification` ([SDK calls that open a system service through sm](services.md#sdk-calls-that-open-a-system-service-through-sm)).
+
+### The output device notification under its SDK 21 and 22 name
+
+- **Symptom:** an `nn::diag` abort with Result 0xe15 on an audio thread at start, in `audio::CreateUserClientSessionByHipc` under `audio::AcquireAudioOutputDeviceNotification`, after the line `sf: the game connects to service aud:u itself`.
+- **Cause:** SDK 21 and 22 name the output device notification `AcquireAudioOutputDeviceNotification` (older SDKs: `AcquireAudioDeviceNotificationForOutput`, and SDK 7's `AcquireAudioDeviceSwitchNotification`). SDK 22.2.0's version (`sdk+0x1f1e00`) opens a user session with `aud:u`, which the host does not serve, asks it for a read end and attaches it AutoClear. It keeps no per-process flag (the service keys each acquire by its event) and returns a Result.
+- **Fix:** `hle_audren.c` takes the name over, first for SDK 21 (Splatoon Raiders); the same takeover serves SDK 22. The event is bound and never signaled, and the Result is 0. The takeover keeps the older names' once-per-process flag, so a second acquire returns 0x499 where SDK 22.2.0's code would bind again. No game has been seen to acquire twice. `ReleaseAudioOutputDeviceNotification` (which destroys the event once the service lets it go) is not taken over: no game seen imports it.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) (Switch 2, SDK 22.2.0, `main+0xe7b9c`).
 
 ### No audio input devices
 

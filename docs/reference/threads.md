@@ -20,6 +20,13 @@ Guest threads, their synchronization and how the host schedules them. Each entry
 - **Check:** `make -C dm/host/tests GAME=010038B015560000 preempt` delays the child's host dispatch by 1 ms and 20 ms. With `DM_PREEMPT=0`, both delayed starts failed before the fix. Afterward both `DM_PREEMPT=0` and `1` pass; the broader mode already supplied the handoff before this correction. Equal-priority, other-core, migratable, host-helper, suspended and host-GPU-work children do not hold up the caller.
 - **Found on:** the threading audit of [FINAL FANTASY TACTICS](../../dm/games/010038B015560000/README.md#threads); its affected workers are lower priority and initially migratable, so this correction does not remove its local wake cut.
 
+### A thread's arguments in slots its starter reuses after connecting to a service
+
+- **Symptom:** a crash at the very start of a new thread, reading through a null pointer it took from its argument (`main+0x1dc0`, in a boot stub's last thread, about once in a dozen boots), with the starter still in its next few calls.
+- **Cause:** the thread reads its arguments from its starter's stack, and the starter reuses those slots a few calls after `StartThread`. [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md)'s boot stub builds them at `main+0x97c`, starts the thread and calls `nn::ro::Initialize`, then builds a string in them at `main+0xa04`. On Horizon `Initialize` connects to ldr:ro, several round trips, so the thread has long read them. The host's `Initialize` returned at once.
+- **Fix:** `dm_thread_service_connect` (`hle_thread.c`), called by the host's `ro::Initialize`, waits until the threads started so far have been dispatched into guest code (at most 50 ms), then for a round trip (200 µs). Only `ro::Initialize` calls it so far. **Open:** like [File system calls are service requests](#file-system-calls-are-service-requests), this models a time rather than giving an order: the thread could still be stopped by the Mac between its dispatch and its read.
+- **Found on:** [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md).
+
 ### Core mask changes move the ideal core into the new mask
 
 - **Symptom:** per-core job queues never drained.
@@ -101,6 +108,13 @@ Guest threads, their synchronization and how the host schedules them. Each entry
 - **Cause:** Unity's job threads tend to crash together.
 - **Fix:** `crash.c` lets only the first crashing thread print (`crash_gate`); the others stop in `pause()`, and a 15 s alarm ends the process if the dump itself stalls.
 - **Found on:** Unity titles in general.
+
+### Watchdog sample output paths are literal arguments
+
+- **Symptom:** `watchdog: sampling failed` and no thread stacks when `DM_WATCH_SAMPLE` contains an apostrophe, such as `/tmp/John's Mac/hang.txt`; shell syntax in the path can also run commands, and long paths are truncated.
+- **Cause:** `crash.c` interpolated the path into a single-quoted command in a fixed-size buffer, then called `system()`. An apostrophe ends the shell quote.
+- **Fix:** spawn `/usr/bin/sample` directly with the PID, one-second duration, `-f` and the unchanged path as separate arguments. Spawn file actions redirect stdout and stderr to `/dev/null`. Setup, spawn, wait, nonzero exit and signal failures retain the failure log; an interrupted wait resumes. The watchdog still exits with `128 + SIGALRM` after sampling.
+- **Found on:** the [static-analysis audit in issue #313](https://github.com/seedds/nxnative/issues/313#issuecomment-6543080671), reproduced with synthetic paths; no game-specific failure is claimed.
 
 ## Synchronization and address arbitration
 
@@ -227,3 +241,12 @@ The yield back-off (`DM_YIELD_BACKOFF`) and the rewriter's spin waits (`patch_ns
 - **Fix:** `dm_thread_native_wait` marks the blocked native-wait interval under the scheduler lock and drops the inherited handoff. `PopNotificationMessage` enters that state while holding the queue mutex, waits, and restores runnable state after reacquiring the mutex. Ordinary native execution is still runnable.
 - **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md#startup).
 - **Check:** the original PR #291 reproducer on upstream `1402ded2` blocks until its watchdog exits with code 99. `make -C dm/host/tests GAME=0100ECD018EBE000 notify-scheduler` now uses real `CreateThread`, `StartThread`, wait-for-exit and close SVCs; only the assembly transition to a guest stack is replaced by a C test entry. The original notification HLE strands `StartThread` until the watchdog exits with code 99. The fixed HLE passes 100 runs in each scheduling mode, including a wake without a queued message, runnable-state restoration and delivery of focus notification 15. The full host test suite (`make -C dm/host/tests GAME=0100ECD018EBE000 run`) also passes with CoreAudio access. The game's note records its separate Mac startup comparison and iPhone report.
+
+### File system calls are service requests
+
+- **Symptom:** every save slot shows NO DATA and `Play Time 0 mins`, right after "Save was successful" and with a save imported from elsewhere, though the files are there and a commit is logged. Reopening the save screen reads no save file (`DM_FS=1`). The terms of service come back at every boot, since the system data save is refused too.
+- **Cause:** a game's worker that sets a flag after `StartThread` returns and clears it as its last act relies on Horizon's order. Digimon Story Cyber Sleuth's save manager (`main+0x16cdf0` and its neighbours) sets its busy byte after the thread call, and its priority-38 worker on the priority-44 main thread's core clears it at its end. On Horizon the worker preempts main, its first file system call blocks in `svcSendSyncRequest` until fsp-srv replies, and main sets the byte meanwhile. The host answered in the worker's own thread, and the [same-core handoff](#same-core-wake-handoffs) held main until the worker exited, so main's store came last, on every run, and the byte stayed set. Later starters refused to run, and their callers, which ignore that, read the last status left behind: "no file", shown as NO DATA.
+- **Fix:** the file system hooks call `dm_thread_service_request` first (`hle_fs.c`, `hle_thread.c`). The caller leaves any handoff it belongs to, as it would by blocking. Leaving is not enough for a started thread, whose remaining calls can end in microseconds, before its starter's 50 µs poll sees it. So the first request of a thread whose `StartThread` holds its caller also waits until that caller is back in guest code, then 200 µs for a service round trip. The wait is bounded at 5 ms, since the starter may be waiting for a peer that needs this thread.
+- **Note:** on Horizon too this order comes from the time a request takes, not from a guarantee; the 200 µs is a model of that, so a starter stopped by the host for longer than that at this exact point would lose the race as before. Only file system calls are service requests here so far; another HLE that stands for a blocking request would call the same function when a game shows it needs that. Waking (not starting) a thread gets the release but no wait, so a reading thread woken for every request does not pay 200 µs each time.
+- **Check:** `make -C dm/host/tests GAME=<id> preempt` (`service_request_start`): with no request the starter is held to the worker's end and the flag stays set, as the game saw it; with one or two, in both scheduling modes, the worker sees the flag and clears it. On the game: a save, reopening the screen, loading and saving again, twelve overwrites in a row, a restart.
+- **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md#saves) ([issue #769](https://github.com/seedds/nxnative/issues/769)).

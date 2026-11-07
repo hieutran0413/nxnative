@@ -155,6 +155,7 @@ static void pads_start(void);   // Physical controllers, below
     CAShapeLayer *_key[B_N]; CATextLayer *_label[B_N];   // one layer per key
     CAShapeLayer *_ring, *_knob;                   // the left stick (the right one is not drawn)
     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
+    NSTimer *_menuHideTimer;
     UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
     unsigned _hapticSticks;
     BOOL _stickShown;                              // the left stick was held at the last refresh
@@ -424,7 +425,24 @@ int front_web_touch(void);
     if (!_stick[0] && dist(p, self.stickHome) / MAX([self stickR:0] * K_STICK_GRAB, _layout.separated ? 22 : 0) < 1) return YES;
     return _full && !_stick[1] && [self inRightArea:p];
 }
+- (void)showMenuButton {
+    _menu.hidden = NO;
+    [_menuHideTimer invalidate];
+    __weak DmGamepad *weakSelf = self;
+    _menuHideTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:NO block:^(NSTimer *timer) {
+        (void)timer;
+        DmGamepad *pad = weakSelf;
+        if (pad) pad->_menu.hidden = YES;
+    }];
+}
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (self.window) [self showMenuButton];
+    else [_menuHideTimer invalidate];
+}
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    // The menu remains accessible at its usual position after the icon hides.
+    if (e.type == UIEventTypeTouches && [self menuTakes:p]) [self showMenuButton];
     UIView *v = [super hitTest:p withEvent:e];
     return v == self && front_web_touch() && ![self controlAt:p] ? nil : v;
 }

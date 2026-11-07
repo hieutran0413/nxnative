@@ -86,24 +86,42 @@ def screen_shape(ctx):
     # entry by the framebuffer's size ([main+0x59ea928] +0x3a8 / +0x3ac) into the 3D views' render scale (+0x4c8 / +0x4cc), and sets the display buffer's crop
     # ([main+0x59e77d8] +0x50, +0x4c..+0x58) to the entry: the presented picture was cropped back to the top 1920x1080 of the 1920x1344 window. The two loads of the
     # entry (main+0x1527f00, main+0x1527f2c) take the height of the screen's shape, the width x the output's height / 1920 in integers (1920 → 1344 exactly; a float
-    # product truncated to 1343). Bit 7 of the sites. s4.. and x16 / x17 are free there
-    for at, orig, cvt, back in ((0x1527f00, 0x2d400500, 0x1e380010, 0x1e220201),    # ldp s0, s1, [x8]; fcvtzs w16, s0; scvtf s1, w16
-                                (0x1527f2c, 0x2d400d02, 0x1e380050, 0x1e220203)):   # ldp s2, s3, [x8]; fcvtzs w16, s2; scvtf s3, w16
+    # product truncated to 1343), then scale both extents by the host's render scale (state +0x10, DM_RENDER_SCALE, rounded to even pixels; 1.0 = bit-exact original).
+    # Bit 7 of the sites. s4.. and x16 / x17 are free there
+    for at, orig, cvt, back, wr, hr in ((0x1527f00, 0x2d400500, 0x1e380010, 0x1e220201, 0, 1),    # ldp s0, s1, [x8]; fcvtzs w16, s0; scvtf s1, w16
+                                        (0x1527f2c, 0x2d400d02, 0x1e380050, 0x1e220203, 2, 3)):   # ldp s2, s3, [x8]; fcvtzs w16, s2; scvtf s3, w16
         site(at, struct.pack('<I', orig).hex())
         start = here(); emit(orig)   # the original load
         emit(ADRP(16, here(), STATE))
         for w in (0xb9405611,   # ldr w17, [x16, #0x54]   sites
-                  0x36380111,   # tbz w17, #7, back (+8)
+                  0x36380111,   # tbz w17, #7, scale (+8)
                   0xb9404a11,   # ldr w17, [x16, #0x48]   the output's height (0 = 16:9)
-                  0x340000d1,   # cbz w17, back (+6)
+                  0x340000d1,   # cbz w17, scale (+6)
                   cvt,          # fcvtzs w16, <width>
                   0x1b117e10,   # mul w16, w16, w17
                   0x5280f011,   # mov w17, #1920
                   0x1ad10a10,   # udiv w16, w16, w17
                   back):        # scvtf <height>, w16
             emit(w)
+        emit(ADRP(16, here(), STATE))
+        for w in (0xbd401204,                         # ldr s4, [x16, #0x10]   render scale (0.5..1.0; 1.0 by default)
+                  0x1e202088,                         # fcmp s4, #0.0
+                  0x5400018d,                         # b.le done (+12)        not set
+                  0x1e2e1005,                         # fmov s5, #1.0
+                  0x1e252080,                         # fcmp s4, s5
+                  0x5400012a,                         # b.ge done (+9)         1.0: bit-exact original
+                  0x1e240800 | (wr << 5) | wr,        # fmul <width>, <width>, s4
+                  0x1e200010 | (wr << 5),             # fcvtns w16, <width>
+                  0x121f7a10,                         # and w16, w16, #0xfffffffe
+                  0x1e220200 | wr,                    # scvtf <width>, w16
+                  0x1e240800 | (hr << 5) | hr,        # fmul <height>, <height>, s4
+                  0x1e200010 | (hr << 5),             # fcvtns w16, <height>
+                  0x121f7a10,                         # and w16, w16, #0xfffffffe
+                  0x1e220200 | hr):                   # scvtf <height>, w16
+            emit(w)
         emit(B(here(), at + 4))
-        put(at, [B(at, start)], 'resolution table entry of the frame (crop, render scale): the height of the screen\'s shape (bit 7)')
+        put(at, [B(at, start)], 'resolution table entry of the frame (crop, render scale): screen shape height (bit 7) and host render scale')
+    ctx.render_scale = 1
     # The layouts' DrawInfo ([+0x60] of the renderer at main+0x31cee50) takes the framebuffer's size twice, 1920.0 x 1080.0 at +0x108 (main+0x31cee58..60) and 1920 x 1080
     # at +0x138 (main+0x31cee98..9c), which nn::ui2d's scissors and captures map the screen with: both take the output's height. Each stub runs the site's original movk
     # first. v16 is dead there (a call follows with x0 only), x16 / x17 free. Bit 8 of the sites
@@ -231,7 +249,7 @@ FRAME_STEP = {
 # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
 # purpose, why; blocked or kept: why the gap stays open
 BINDING = [
-    {'what': "screen shape: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
-     'why': "the output size is the host's, but where the game takes its sizes, its cameras and its layouts are this build's code",
+    {'what': "screen shape and render scale: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT, DM_RENDER_SCALE)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+     'why': "the output size and scale are the host's, but where the game takes its sizes, its cameras and its layouts are this build's code",
      'blocked': 'the stubs have no function-matched form yet'},
 ]

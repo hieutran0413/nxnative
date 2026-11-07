@@ -7,20 +7,28 @@ Switch games store most textures BC-compressed. Apple GPUs read BC only from the
 The decision is made at run time, so one IPA serves every device:
 
 - `no_bc()` in `dm/gfx/nvn/nvn_mtl.m` asks `[g_dev supportsBCTextureCompression]` once. `DM_TEST_NO_BC=1` forces the same path on a Mac. On a GPU with BC nothing changes (no extra memory, no log line).
-- Without BC, a BC texture is created in a decompressed format (`nvn_bc_unpacked` in `dm/gfx/tex/nvn_bcdec.c`): BC1–3 and BC7 become RGBA8 (sRGB variants likewise), BC4 R8, BC5 RG8, BC6H RGBA16F. `tex_desc` picks the format; BC4 / BC5 keep their signedness.
-- Upload (`dm/gfx/nvn/nvn_mtl.m`, the texture upload function): BC1–5 are deswizzled on the GPU and decompressed by the `bcd` kernel (`bcd_pso`); BC6H, BC7 and 3D textures are decompressed on the CPU with `dm/third_party/bcdec` after the CPU deswizzle.
-- Buffer → texture copies (`copy_b2t`) decompress the source blocks on the CPU into a temporary buffer; texture → texture copies from ASTC sources use `copy_t2t_astc`.
-- Views of BC textures switch to the decompressed format, and a BC texture stored decompressed is never attached as a render target (`attach`, `rt_view_fmt`), as on GPUs with BC.
-
-The code is the no-BC path removed in commit `14fbcf9` (it removed it because decompressed textures did not fit a 6 GB iPhone for Breath of the Wild), restored in `99ab322` and kept behind the device check.
-
-## The cost
-
-Decompressed textures take 2–8 times the memory. Breath of the Wild needed about 3.9 GB instead of 2.8 GB. Tears of the Kingdom (5 GB guest layout) is heavier still, and without the Increased Memory Limit entitlement an app gets about 3.4 GB (README). Expect the bigger games to be closed by iOS on an A16 unless it is signed with that entitlement. If a game does not fit, the next step is to re-encode BC as ASTC at load time (about the size of BC; costs CPU time and some quality); it is not implemented.
+- **Runtime BC1 / BC3 → ASTC 4×4 transcoding (`dm/gfx/tex/nvn_bcastc.*`)**:
+  - 2D / 2D-array / cube BC1 (`RGB_DXT1`, `RGBA_DXT1` + sRGB) and BC3 (`RGBA_DXT5` + sRGB) textures are transcoded at upload time into `MTLPixelFormatASTC_4x4_LDR` / `MTLPixelFormatASTC_4x4_sRGB` (1 byte/pixel — 4× smaller than `RGBA8`, matching BC3's exact byte size).
+  - GPU upload batches run the `bc1a` / `bc3a` compute kernels (`dm/gfx/tex/nvn_bcastc_msl.h`) right after GPU deswizzling and before the texture blit; CPU paths (`copy_b2t` fallback, sparse sub-tile uploads) use `nvn_bc_astc_encode` (`dm/gfx/tex/nvn_bcastc.c`).
+  - Set `DM_NO_BC_ASTC=0` to disable ASTC transcoding completely, or `DM_NO_BC3_ASTC=0` to transcode only BC1 and decode BC3 to `RGBA8`.
+- **Remaining BC formats (`dm/gfx/tex/nvn_bcdec.c` & `bcd` compute kernel)**:
+  - BC2, BC7 and 3D BC1/BC3 become `RGBA8` (or `RGBA8_sRGB`), BC4 becomes `R8` (1 byte/pixel), BC5 becomes `RG8` (2 bytes/pixel), and BC6H becomes `RGBA16F`.
+  - `tex_desc` preserves Apple GPU hardware lossless compression on `no_bc()` textures by omitting `MTLTextureUsagePixelFormatView` unless an unpacked sRGB BC texture requires an `RGBA8Unorm` compute-write view for `bcd`, and omitting `MTLTextureUsageShaderWrite` on ASTC-transcoded and CPU-decoded textures.
+  - Both CPU (`nvn_bcdec.c`) and GPU (`k_bcd_msl`, `fmt == 8`) distinguish `NVN_FORMAT_RGB_DXT1` (`0x41` / `0x45`, opaque black `(0,0,0,1)` on selector 3 when `c0 <= c1`) from `NVN_FORMAT_RGBA_DXT1` (`0x42` / `0x46`, transparent `(0,0,0,0)`).
+- **Buffer → texture (`copy_b2t`) and texture → texture (`copy_t2t`) copies**:
+  - `copy_b2t` into an ASTC-transcoded BC1/BC3 texture dispatches `bc1a` / `bc3a` on the GPU into the frame arena and blits the ASTC blocks; `copy_b2t` into an unpacked 2D BC1–BC5 texture at `(0,0)` dispatches `bcd` directly from the source buffer without allocating a temporary `Shared` buffer.
+  - `copy_t2t` between `ASTC_4x4_LDR` and `ASTC_4x4_sRGB` uses a format view + blit, and `copy_t2t` from `ASTC_4x4` into an `RGBA8` destination upgrades the destination with `MTLTextureUsageShaderWrite` if needed before running `copy_t2t_astc`.
+- **Placement-sparse BC textures (`sparse_make`, `sparse_sync`)**:
+  - On `no_bc()`, placement-sparse 2D/array BC textures are backed by sparse `ASTC_4x4` or unpacked Metal textures using `sub_x × sub_y` Metal sparse tiles per 64 KB NVN tile when the expanded format exceeds 64 KB per NVN tile, and transcode/decode each mapped tile on upload.
+- **iOS Memory Pressure Watcher & LRU Eviction (`mtl_memory_pressure`, `mtl_trim_memory`)**:
+  - `front_ios.m` monitors `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` (`WARN` / `CRITICAL`), `UIApplicationDidReceiveMemoryWarningNotification`, and `os_proc_available_memory()` every 32 submissions in `mtl_sub_begin` (plus app suspend in `dm_gfx_suspend`).
+  - Under memory pressure, `mtl_trim_memory` reclaims completed `NvPkg->spare` textures, shrinks oversized upload staging buffers (`g_up_slot_blk`, `g_up_slot_over`), drops unreferenced `g_alias` textures, and evicts cold `no_bc()` `NvPkg` textures backed by live guest memory (`pk->evicted = 1`), re-hydrating them automatically in `tex_mtl_` only when a shader or draw actually samples them again.
 
 ## Checking it
 
-On the Mac: `make -C dm/host GAME=<id>`, then run the game with `DM_TEST_NO_BC=1`; the log must show `GPU has no BC texture formats (test switch DM_TEST_NO_BC)` and `no BC: BC1–5 are decompressed on the GPU`, and no `invalid pixelFormat`. On an iPhone, the same first line appears in `log.txt` (Files app) on an A16 and must not appear on an A17 Pro.
+On the Mac:
+- Run `make -C dm/gfx/tex/tests` and `make -C dm/gfx/tests GAME=<id> t_nobc_mem && DM_TEST_NO_BC=1 MTL_DEBUG_LAYER=1 ./dm/gfx/tests/t_nobc_mem`.
+- Or build `make -C dm/host GAME=<id>` and run the game with `DM_TEST_NO_BC=1`; the log shows `GPU has no BC texture formats (test switch DM_TEST_NO_BC): BC1/BC3 2D textures are transcoded to ASTC 4x4; remaining BC formats are stored decompressed`.
 
 ## Building a game with the fix (for example Tears of the Kingdom)
 

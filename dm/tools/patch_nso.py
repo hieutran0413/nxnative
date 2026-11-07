@@ -152,8 +152,14 @@ for off, ob, nb, why in cuts:
     IMG[off:off + len(nb)] = nb
 
 # Atmosphere IPS patches support
-ips_dir = os.environ.get('DM_IPS_DIR', '/Volumes/My Data/Development/Games/AnimalCrossing/mods/extracted_60fps/atmosphere/exefs_patches/ACNH_60FPS_SpeedFix')
-if os.path.isdir(ips_dir):
+_candidate_ips_dirs = [
+    os.environ.get('DM_IPS_DIR'),
+    '/Volumes/My Data/Development/Games/data/AnimalCrossing/mods_archive_disabled/extracted_60fps/atmosphere/exefs_patches/ACNH_60FPS_SpeedFix',
+    '/Volumes/My Data/Development/Games/data/AnimalCrossing/mods/extracted_60fps/atmosphere/exefs_patches/ACNH_60FPS_SpeedFix',
+    '/Volumes/My Data/Development/Games/AnimalCrossing/mods/extracted_60fps/atmosphere/exefs_patches/ACNH_60FPS_SpeedFix',
+]
+ips_dir = next((d for d in _candidate_ips_dirs if d and os.path.isdir(d)), None)
+if ips_dir:
     for ips_path in glob.glob(os.path.join(ips_dir, '*.ips')):
         ips_name = os.path.basename(ips_path).upper()
         if ips_name.startswith(BUILD_ID.upper()):

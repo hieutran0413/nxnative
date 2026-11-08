@@ -4,12 +4,14 @@ CFLAGS = -O2 -g -Wall -Wextra
 SAN ?=
 O ?=
 CLANG = clang $(SAN)
-$(O)t_tex: t_tex.c ../nvn_deswizzle.c ../nvn_deswizzle.h ../../nvn/nvn_tex.c ../../nvn/nvn_tex.h
-	$(CLANG) $(CFLAGS) -o $@ t_tex.c ../nvn_deswizzle.c ../../nvn/nvn_tex.c -lm
+$(O)t_tex: t_tex.c ../nvn_deswizzle.c ../nvn_deswizzle.h ../nvn_bcdec.c ../nvn_bcdec.h ../nvn_bcastc.c ../nvn_bcastc.h ../nvn_bcastc_lut.h ../../nvn/nvn_tex.c ../../nvn/nvn_tex.h
+	$(CLANG) $(CFLAGS) -o $@ t_tex.c ../nvn_deswizzle.c ../nvn_bcdec.c ../nvn_bcastc.c ../../nvn/nvn_tex.c -lm
 $(O)t_fmt_mtl: t_fmt_mtl.m ../nvn_fmt_mtl.c ../nvn_fmt_mtl.h
 	$(CLANG) $(CFLAGS) -fobjc-arc -o $@ t_fmt_mtl.m ../nvn_fmt_mtl.c -framework Metal -framework Foundation
-run: t_tex t_fmt_mtl
-	./t_fmt_mtl && ./t_tex
+$(O)t_bcastc: t_bcastc.m ../nvn_bcdec.c ../nvn_bcdec.h ../nvn_bcastc.c ../nvn_bcastc.h ../nvn_bcastc_lut.h ../nvn_bcastc_msl.h
+	$(CLANG) $(CFLAGS) -fobjc-arc -o $@ t_bcastc.m ../nvn_bcdec.c ../nvn_bcastc.c -framework Metal -framework Foundation
+run: t_tex t_fmt_mtl t_bcastc
+	./t_fmt_mtl && ./t_tex && MTL_DEBUG_LAYER=1 ./t_bcastc
 .PHONY: run
 # ASan and UBSan (../../../sanitizers/sanitizers.mk): the CPU test t_tex, built into asan/ (t_fmt_mtl creates Metal textures and stays local)
 include ../../../sanitizers/sanitizers.mk

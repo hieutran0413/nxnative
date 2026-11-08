@@ -1,6 +1,8 @@
 // Block-linear deswizzle unit tests (seconds). A round trip; B hand-calculated addresses; E hand-built 3D.
 // Usage: t_tex
 #include "../nvn_deswizzle.h"
+#include "../nvn_bcdec.h"
+#include "../nvn_bcastc.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -244,6 +246,34 @@ int main(void) {
         d.flags = 0; nvn_tex_layout(&d, &L);   // the same texture not sparse keeps the packed layout
         CHECK(nvn_tex_level_offset(&d, 1) == 0x81000 && L.size == 0xBC400 && nvn_tex_level_gobs(&d, 0) == 43, "S not sparse: level 1 %#llx storage %#llx, expected 0x81000 / 0xbc400",
               (unsigned long long)nvn_tex_level_offset(&d, 1), (unsigned long long)L.size);
+    }
+
+    // ---------- T BC1 / BC3 decompression & ASTC 4x4 transcoding CPU checks ----------
+    printf("T BC1 / BC3 decode and ASTC 4x4 transcoding\n");
+    {
+        uint32_t pf = 0;
+        CHECK(nvn_bc_astc_pf(0x41, 1, &pf) && pf == 204, "BC1 RGB_DXT1 -> ASTC_4x4_LDR");
+        CHECK(nvn_bc_astc_pf(0x46, 1, &pf) && pf == 186, "BC1 RGBA_DXT1_SRGB -> ASTC_4x4_sRGB");
+        CHECK(nvn_bc_astc_pf(0x44, 1, &pf) && pf == 204 && !nvn_bc_astc_pf(0x44, 0, &pf), "BC3 allow_bc3 gate");
+        CHECK(!nvn_bc_astc_pf(0x49, 1, &pf) && !nvn_bc_astc_pf(0x4d, 1, &pf), "BC4 / BC7 excluded from ASTC");
+        // RGB_DXT1 (0x41) 3-color block with selector 3 must decode to opaque black (0, 0, 0, 255), while RGBA_DXT1 (0x42) decodes to (0, 0, 0, 0)
+        uint8_t bc1_3c[8] = {0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        uint8_t rgba41[64], rgba42[64], astc[16];
+        CHECK(!nvn_bc_decode(0x41, bc1_3c, 8, 4, 4, rgba41, 16), "nvn_bc_decode 0x41");
+        CHECK(!nvn_bc_decode(0x42, bc1_3c, 8, 4, 4, rgba42, 16), "nvn_bc_decode 0x42");
+        CHECK(rgba41[3] == 255 && rgba41[63] == 255 && rgba42[3] == 0 && rgba42[63] == 0, "RGB_DXT1 vs RGBA_DXT1 selector 3 alpha");
+        // Exercise all BC1 and BC3 code paths under ASan / UBSan
+        uint8_t bc1_grid[64 * 8], bc3_grid[64 * 16], astc_grid[64 * 16];
+        for (size_t i = 0; i < sizeof(bc1_grid); i++) bc1_grid[i] = rnd();
+        for (size_t i = 0; i < sizeof(bc3_grid); i++) bc3_grid[i] = rnd();
+        memcpy(bc1_grid, bc1_3c, 8);
+        uint8_t bc1_3c_nz[8] = {0x21, 0x08, 0xff, 0x7f, 0xe4, 0xe4, 0xe4, 0xe4};
+        memcpy(bc1_grid + 8, bc1_3c_nz, 8);
+        memset(bc3_grid, 0, 16);
+        CHECK(!nvn_bc_astc_encode(0x41, bc1_grid, 8 * 8, 32, 32, astc_grid, 8 * 16), "nvn_bc_astc_encode 0x41");
+        CHECK(!nvn_bc_astc_encode(0x46, bc1_grid, 8 * 8, 32, 32, astc_grid, 8 * 16), "nvn_bc_astc_encode 0x46");
+        CHECK(!nvn_bc_astc_encode(0x48, bc3_grid, 8 * 16, 32, 32, astc_grid, 8 * 16), "nvn_bc_astc_encode 0x48");
+        CHECK(nvn_bc_astc_encode(0x49, bc3_grid, 8 * 16, 32, 32, astc, 16) == -1, "nvn_bc_astc_encode rejects BC4");
     }
 
     printf("%s: %d/%d checks passed\n", fails ? "RED" : "all passed", checks - fails, checks);

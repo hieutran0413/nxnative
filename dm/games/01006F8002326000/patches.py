@@ -2,7 +2,7 @@
 # ID (FRAME_STEP as described there, "Registered patches"). The game has no frame step stubs: FRAME_STEP only gives its main the state page that the screen shape stubs read
 # (DM_SCREEN_ASPECT, as for Breath of the Wild); with DM_SCREEN_ASPECT unset the page stays zero and every stub runs the original instructions.
 import struct
-from nso_asm import ADRP, B
+from nso_asm import ADRP, B, NOP
 
 # Screen shape (DM_SCREEN_ASPECT, loader.c): a screen taller than 16:9 keeps the picture's width (1920) and takes the height of the screen's ratio (state +0x48, 1344 at 1.43), the
 # layout space 1280 x 2/3 of it (+0x4c, 896; +0x50 the same as a float). The game's platform config (vtable main+0x47fa0e0, no RTTI) hands its sizes out three ways:
@@ -264,6 +264,8 @@ def screen_shape(ctx):
     put(0x37b8c94, [B(0x37b8c94, start)], 'sead::GameFrameworkNx::procFrame_: 2-calc-per-1-draw catch-up ([fw + 0x242] = 3) when frame step >= 2 vsyncs')
     site(0x37b94f4, '60a240bd')
     put(0x37b94f4, [B(0x37b94f4, 0x37b9904)], 'sead::GameFrameworkNx::waitForGpu_: return immediately on Tick A ([fw + 0x242] == 3) so Tick B procCalc_ runs in parallel with GPU')
+    site(0x3c88e68, '20090036')
+    put(0x3c88e68, [NOP], 'prepare_ (main+0x3c88be8): always allocate the secondary UBO ring [task + 0x430] used when [fw + 0x242] == 3 (main+0x3ba1650, main+0x3c89238, main+0x3c892d4)')
 
 
 

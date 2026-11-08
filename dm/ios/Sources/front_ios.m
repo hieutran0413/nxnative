@@ -8,6 +8,9 @@
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
+#if __has_include(<os/proc.h>)
+#include <os/proc.h>
+#endif
 #include "front.h"
 #include "hle.h"
 #include "dm.h"
@@ -44,7 +47,7 @@ static UILabel *front_ios_fps_label(void);
         }];
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        l.contentsScale = MAX(self.traitCollection.displayScale, 1); l.framebufferOnly = NO; l.opaque = YES;
+        l.contentsScale = MAX(self.traitCollection.displayScale, 1); l.framebufferOnly = YES; l.opaque = YES;
         self.backgroundColor = UIColor.blackColor;
     }
     return self;
@@ -55,9 +58,14 @@ static UILabel *front_ios_fps_label(void);
     CAMetalLayer *l = (CAMetalLayer *)self.layer;
     UIScreen *screen = self.window.windowScene.screen;
     CGFloat scale = screen ? screen.nativeScale : MAX(self.traitCollection.displayScale, 1);
-    if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
-    l.contentsScale = scale;
-    l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
+    if (self.maxPixelWidth > 0 && self.maxPixelWidth < self.bounds.size.width * scale) {
+        scale = self.maxPixelWidth / MAX(self.bounds.size.width, 1);
+        l.contentsScale = scale;
+        l.drawableSize = CGSizeMake(round(self.bounds.size.width * scale), round(self.bounds.size.height * scale));
+    } else {
+        l.contentsScale = scale;
+        l.drawableSize = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);
+    }
 }
 @end
 static void tv_attach(void);
@@ -96,6 +104,7 @@ static void tv_attach(void);
 @end
 static DmRootVC *g_root;
 static CGFloat g_picture_aspect = DM_PICTURE_16_9;   // the presented picture's width / height (front_picture_shape); main thread
+static CGFloat g_present_width;   // the presented picture's pixel width cap under Standard upscaling (front_present_pixels, 0 = uncapped); main thread
 static void launcher_done(void) { [g_root startGame]; }
 @implementation DmRootVC
 - (void)loadView { self.view = [DmRootView new]; }
@@ -165,6 +174,7 @@ static void launcher_done(void) { [g_root startGame]; }
     self.view.clipsToBounds = YES;   // with Fill the game view is larger than the screen
     self.view.window.traitOverrides.preferredContentSizeCategory = UIContentSizeCategorySmall;   // UIKit draws the in-game menu (GameMenu.swift) in this window: it keeps one compact text size over the game, whatever the system's text size
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
+    self.game.maxPixelWidth = g_present_width;
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
@@ -254,7 +264,7 @@ static void tv_attach(void) {
     LOG("front end: TV connected (%.0fx%.0f points), the picture moves there at %.0fx%.0f, console mode", g_tv.bounds.size.width, g_tv.bounds.size.height, f.size.width * scale, f.size.height * scale);
 }
 static void tv_detach(void) {
-    DmGameView *v = g_root.game; g_tv = nil; v.maxPixelWidth = 0;
+    DmGameView *v = g_root.game; g_tv = nil; v.maxPixelWidth = g_present_width;
     if (v && v.superview != g_root.view) { [g_root.view insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
     if (g_tv_mode_was >= 0) { dm_set_opmode(g_tv_mode_was); g_tv_mode_was = -1; dm_gamepad_opmode_changed(); }
     LOG("front end: TV disconnected, the picture is back on the phone");
@@ -266,6 +276,18 @@ void front_picture_shape(int w, int h) {   // front.h: the views take the presen
         if (a == g_picture_aspect) return;
         g_picture_aspect = a; LOG("front end: picture shape %dx%d, the game's view follows it", w, h);
         [g_root.view setNeedsLayout]; if (g_tv) [g_tv.rootViewController.view setNeedsLayout];
+    });
+}
+void front_present_pixels(int w) {   // front.h: under Standard upscaling, cap the phone's drawable to the presented picture's pixel width so DisplayPipe scales in hardware
+    CGFloat pw = w > 0 ? w : 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (pw == g_present_width) return;
+        g_present_width = pw;
+        if (!g_tv && g_root.game) {
+            g_root.game.maxPixelWidth = pw;
+            [g_root.game setNeedsLayout];
+            LOG("front end: phone drawable pixel width cap → %.0f (0 = screen native)", pw);
+        }
     });
 }
 
@@ -309,6 +331,14 @@ static _Atomic double g_brightness = -1;
 int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
+static dispatch_source_t g_mem_src;
+static size_t ios_avail_mb(void) {
+#if __has_include(<os/proc.h>) && !TARGET_OS_SIMULATOR
+    return os_proc_available_memory() >> 20;
+#else
+    return 0;
+#endif
+}
 static void front_ios_power_watch(void) {
     g_brightness = UIScreen.mainScreen.brightness;
     [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_brightness = UIScreen.mainScreen.brightness; }];
@@ -316,7 +346,24 @@ static void front_ios_power_watch(void) {
         (void)n; LOG("front end: thermal state → %d (%.0f s after launch)", dm_thermal_now(), (now_ns() - g_t0_ns) / 1e9); }];
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: Low Power Mode → %s (%.0f s after launch)", dm_low_power_now() ? "on" : "off", (now_ns() - g_t0_ns) / 1e9); }];
-    LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off");
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        (void)n; LOG("front end: UIKit memory warning (avail %zu MB, %.0f s after launch)", ios_avail_mb(), (now_ns() - g_t0_ns) / 1e9);
+        dm_gfx_memory_pressure(2); }];
+    if (!g_mem_src) {
+        g_mem_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_main_queue());
+        if (g_mem_src) {
+            dispatch_source_set_event_handler(g_mem_src, ^{
+                unsigned long f = dispatch_source_get_data(g_mem_src);
+                int lvl = (f & DISPATCH_MEMORYPRESSURE_CRITICAL) ? 2 : (f & DISPATCH_MEMORYPRESSURE_WARN) ? 1 : 0;
+                if (lvl) {
+                    LOG("front end: system memory pressure → %s (avail %zu MB, %.0f s after launch)", lvl > 1 ? "critical" : "warn", ios_avail_mb(), (now_ns() - g_t0_ns) / 1e9);
+                    dm_gfx_memory_pressure(lvl);
+                }
+            });
+            dispatch_resume(g_mem_src);
+        }
+    }
+    LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s, avail %zu MB", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off", ios_avail_mb());
 }
 
 // Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).

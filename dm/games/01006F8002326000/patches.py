@@ -2,7 +2,7 @@
 # ID (FRAME_STEP as described there, "Registered patches"). The game has no frame step stubs: FRAME_STEP only gives its main the state page that the screen shape stubs read
 # (DM_SCREEN_ASPECT, as for Breath of the Wild); with DM_SCREEN_ASPECT unset the page stays zero and every stub runs the original instructions.
 import struct
-from nso_asm import ADRP, B, NOP
+from nso_asm import ADRP, B
 
 # Screen shape (DM_SCREEN_ASPECT, loader.c): a screen taller than 16:9 keeps the picture's width (1920) and takes the height of the screen's ratio (state +0x48, 1344 at 1.43), the
 # layout space 1280 x 2/3 of it (+0x4c, 896; +0x50 the same as a float). The game's platform config (vtable main+0x47fa0e0, no RTTI) hands its sizes out three ways:
@@ -239,34 +239,6 @@ def screen_shape(ctx):
         emit(0xbd000001 | (o << 10))   # str s1, [x0, #0x10 + 4 i]
     emit(0xd65f03c0)   # ret
     put(0x265140, [B(0x265140, start)], 'nn::ui2d::DrawInfo::SetProjectionMtx: the y row divided by the vertical stretch, layouts in their own shape (bit 6)')
-    # Frame step catch-up (sead::GameFrameworkNx::procFrame_ at main+0x37b8c94, right after procDraw_ and before procCalc_): when the host's frame step (+0x20, fstep_tick)
-    # steps 2 vsyncs (paying back a dropped frame at 60 fps, or pacing at a 30 fps cap), set [fw + 0x242] = 3 so the engine runs two procCalc_ ticks for one procDraw_
-    # (Tick A draws and runs Calc #1 with bit 2 of [SystemTask + 0x46c] cleared, skips waitForGpu_ at main+0x37b94f4, and flips [fw + 0x242] to 1; Tick B skips procDraw_,
-    # runs Calc #2 in parallel with Tick A's GPU work, resets [fw + 0x242] to 0, and waits for the GPU). Thus game time = real time even when FPS drops below 60
-    site(0x37b8c94, '680240f9')
-    start = here(); emit(ADRP(16, here(), STATE))
-    for w in (0xb9400211,   # ldr w17, [x16]          target fps (float bits; 0 = off)
-              0x34000191,   # cbz w17, orig (+12)
-              0x39490a69,   # ldrb w9, [x19, #0x242]  2-calc-per-1-draw state (0 = normal/Tick A, 1 = Tick B)
-              0x350000e9,   # cbnz w9, count (+7)
-              0xb9402211,   # ldr w17, [x16, #0x20]   step in vsyncs decided by fstep_tick
-              0x34000111,   # cbz w17, orig (+8)      not decided yet
-              0x71000a3f,   # cmp w17, #2
-              0x54000063,   # b.lo count (+3)         step == 1: keep [x19, #0x242] == 0
-              0x52800069,   # mov w9, #3              step >= 2: start 2-calc-per-1-draw pair (3 -> 1 -> 0)
-              0x39090a69,   # strb w9, [x19, #0x242]
-              0xf9401a09,   # count: ldr x9, [x16, #0x30]
-              0x91000529,   # add x9, x9, #1
-              0xf9001a09,   # str x9, [x16, #0x30]    vsyncs stepped
-              0xf9400268):  # orig: ldr x8, [x19]
-        emit(w)
-    emit(B(here(), 0x37b8c98))
-    put(0x37b8c94, [B(0x37b8c94, start)], 'sead::GameFrameworkNx::procFrame_: 2-calc-per-1-draw catch-up ([fw + 0x242] = 3) when frame step >= 2 vsyncs')
-    site(0x37b94f4, '60a240bd')
-    put(0x37b94f4, [B(0x37b94f4, 0x37b9904)], 'sead::GameFrameworkNx::waitForGpu_: return immediately on Tick A ([fw + 0x242] == 3) so Tick B procCalc_ runs in parallel with GPU')
-    site(0x3c88e68, '20090036')
-    put(0x3c88e68, [NOP], 'prepare_ (main+0x3c88be8): always allocate the secondary UBO ring [task + 0x430] used when [fw + 0x242] == 3 (main+0x3ba1650, main+0x3c89238, main+0x3c892d4)')
-
 
 
 FRAME_STEP = {

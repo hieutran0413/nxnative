@@ -68,6 +68,22 @@ static class P {
         if (a.Length >= 3 && a[1] == "--keys") return Keys(ExternalKeyReader.ReadKeyFile(a[0]), a[2..]);
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--app <title ID>] [--program=<title ID>] [--list] [--html] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [<DLC title ID>] [--romfs-image]\n       nx_extract <prod.keys> --contents <nsp|nsz|xci|xcz>...\n       nx_extract <prod.keys> --keys <nsp|nsz|xci|xcz>..."); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
+        if (a[1] == "--get") {
+            var bPkg = OpenNsp(ks, a[2]); var uPkg = a[3] == "-" ? null : OpenNsp(ks, a[3]);
+            Nca bProg = Pick(bPkg, NcaContentType.Program) ?? throw new Exception("no base");
+            Nca uProg = uPkg == null ? null : Pick(uPkg, NcaContentType.Program, bProg.Header.TitleId);
+            IStorage r = uProg != null ? bProg.OpenStorageWithPatch(uProg, NcaSectionType.Data, IntegrityCheckLevel.None) : bProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.None);
+            var fs = new RomFsFileSystem(r);
+            using var f = new UniqueRef<IFile>();
+            string target = a[4].StartsWith("/") ? a[4] : "/" + a[4];
+            fs.OpenFile(ref f.Ref, target.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+            f.Get.GetSize(out long size).ThrowIfFailure();
+            byte[] buf = new byte[size];
+            f.Get.Read(out long read, 0, buf).ThrowIfFailure();
+            File.WriteAllBytes(a[5], buf);
+            Console.WriteLine($"Extracted {target} ({size} bytes) -> {a[5]}");
+            return 0;
+        }
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], image, a.Length > 4 ? Convert.ToUInt64(a[4], 16) : null);
         // each by its own content meta: a merged package (base game + update + DLC in one NSP, a cartridge dump with its update) is given as both the base game and the update,
         // and the base game's Program NCA and the update's have the same title ID, so without the filter the update would be layered on itself or on the wrong base

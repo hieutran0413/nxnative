@@ -320,7 +320,18 @@ def pack(a):
     if tables: copy(tables, dm, False)
     if pairs: shutil.copyfile(pairs, dm / 'pso_pairs.tsv')   # the split's copy, for a profile without the table
     if fonts: copy(fonts, dm / 'font', False)
-    if a.env_file: shutil.copyfile(a.env_file, dm / 'env.txt')
+    if a.env_file:
+        if a.settings and Path(a.settings).is_file():
+            try:
+                sdata = json.loads(Path(a.settings).read_text(encoding='utf-8'))
+                lkeys = {s['env'] for s in sdata.get('settings', []) if 'env' in s}
+                elines = Path(a.env_file).read_text(encoding='utf-8').splitlines()
+                kept = [ln for ln in elines if not any(ln.strip().startswith(k + '=') for k in lkeys)]
+                (dm / 'env.txt').write_text('\n'.join(kept) + ('\n' if kept else ''), encoding='utf-8')
+            except Exception:
+                shutil.copyfile(a.env_file, dm / 'env.txt')
+        else:
+            shutil.copyfile(a.env_file, dm / 'env.txt')
     if a.settings: shutil.copyfile(a.settings, dm / 'launcher.json')
     step('shader libraries'); msl_dst = res / 'msl' / (a.msl_name or msl.name); msl_dst.parent.mkdir(exist_ok=True); copy_msl(msl, msls, msl_dst, clone['msl'])
     if aoc: step('add-on content'); copy([aoc], res / 'aoc', clone['aoc'])
